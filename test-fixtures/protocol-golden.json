@@ -1,0 +1,24 @@
+{
+  "protocolVersion": 2,
+  "handshake": {
+    "method": "session.hello",
+    "params": {
+      "clientName": "Tablet-Companion",
+      "version": "0.2.0",
+      "protocolVersion": 2,
+      "token": "tok-12345"
+    }
+  },
+  "inkCommit": {
+    "method": "ink.commit",
+    "params": {
+      "nodeId": "file:test.org::id:abc-123",
+      "fileName": "diagram.svgz",
+      "width": 1200,
+      "height": 600,
+      "baseEtag": "sha1-prev-hash",
+      "svgzBase64": "H4sIC...",
+      "ocrText": "Architecture Overview"
+    }
+  }
+}
