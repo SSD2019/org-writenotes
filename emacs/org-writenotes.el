@@ -217,13 +217,14 @@ repairs the file on disk to single-gzipped `.svgz'."
     (message "[Org-WriteNotes] Enabled inline .svgz rendering.")))
 
 (defun org-writenotes--refresh-inline-image (&optional _saved-path)
-  "Clear Emacs image cache and refresh inline images in Org buffers."
+  "Clear Emacs image cache and refresh inline images in visible Org buffers."
   (when (fboundp 'clear-image-cache)
     (ignore-errors (clear-image-cache)))
   (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (when (derived-mode-p 'org-mode)
-        (ignore-errors (org-display-inline-images t t)))))
+    (when (get-buffer-window buf 'visible)
+      (with-current-buffer buf
+        (when (derived-mode-p 'org-mode)
+          (ignore-errors (org-display-inline-images t t))))))
   (redisplay))
 
 (defun org-writenotes--resolve-image-dir (org-file)
@@ -897,19 +898,30 @@ Returns `(opcode payload-string remaining-bytes)' or nil if incomplete."
                   offset 10))))
         (let ((mask-len (if masked 4 0)))
           (when (and payload-len (>= total (+ offset mask-len payload-len)))
-            (let* ((mask-key (when masked
-                               (substring buffer-bytes offset (+ offset 4))))
-                   (data-start (+ offset mask-len))
+            (let* ((data-start (+ offset mask-len))
                    (data-end (+ data-start payload-len))
-                   (raw (substring buffer-bytes data-start data-end))
                    (unmasked
                     (if masked
-                        (let ((out (make-string payload-len 0)))
-                          (dotimes (i payload-len)
-                            (aset out i (logxor (aref raw i)
-                                                (aref mask-key (mod i 4)))))
+                        (let ((out (make-string payload-len 0 nil))
+                              (m0 (aref buffer-bytes offset))
+                              (m1 (aref buffer-bytes (+ offset 1)))
+                              (m2 (aref buffer-bytes (+ offset 2)))
+                              (m3 (aref buffer-bytes (+ offset 3)))
+                              (i 0)
+                              (limit (- payload-len 3)))
+                          (while (< i limit)
+                            (let ((src (+ data-start i)))
+                              (aset out i       (logxor (aref buffer-bytes src) m0))
+                              (aset out (+ i 1) (logxor (aref buffer-bytes (+ src 1)) m1))
+                              (aset out (+ i 2) (logxor (aref buffer-bytes (+ src 2)) m2))
+                              (aset out (+ i 3) (logxor (aref buffer-bytes (+ src 3)) m3)))
+                            (setq i (+ i 4)))
+                          (while (< i payload-len)
+                            (let ((mask-b (aref buffer-bytes (+ offset (logand i 3)))))
+                              (aset out i (logxor (aref buffer-bytes (+ data-start i)) mask-b)))
+                            (setq i (1+ i)))
                           out)
-                      raw))
+                      (substring buffer-bytes data-start data-end)))
                    (rest (substring buffer-bytes data-end)))
               (list opcode
                     (decode-coding-string unmasked 'utf-8)
