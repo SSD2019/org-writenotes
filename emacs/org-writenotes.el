@@ -391,15 +391,25 @@ repairs the file on disk to single-gzipped `.svgz'."
 
 (defun org-writenotes--goto-body-start (beg end)
   "Move point to the first body line after heading at BEG and any planning/drawers before END."
-  (goto-char beg)
-  (forward-line 1)
-  (while (and (< (point) end)
-              (looking-at-p "^\\s-*\\(SCHEDULED:\\|DEADLINE:\\|CLOSED:\\|:[A-Za-z0-9_]+:\\)"))
-    (if (looking-at "^\\s-*:\\(PROPERTIES\\|LOGBOOK\\):\\s-*$")
-        (if (re-search-forward "^\\s-*:END:\\s-*$" end 'move)
-            (forward-line 1)
-          (goto-char end))
-      (forward-line 1))))
+  (goto-char (max (point-min) (min (point-max) (or beg (point)))))
+  (let ((lim (max (point) (min (point-max) (or end (point-max))))))
+    (if (fboundp 'org-end-of-meta-data)
+        (progn
+          (org-end-of-meta-data t)
+          (when (> (point) lim)
+            (goto-char lim)))
+      ;; Fallback: manual scan over planning and drawers
+      (forward-line 1)
+      (while (and (< (point) lim)
+                  (or (looking-at-p "^[ \t]*$")
+                      (looking-at-p "^[ \t]*\\(SCHEDULED:\\|DEADLINE:\\|CLOSED:\\)")
+                      (looking-at-p "^[ \t]*:[A-Za-z0-9_@#$-]+:[ \t]*$")))
+        (if (looking-at "^[ \t]*:[A-Za-z0-9_@#$-]+:[ \t]*$")
+            (if (re-search-forward "^[ \t]*:END:[ \t]*$" lim 'move)
+                (forward-line 1)
+              (goto-char lim))
+          (forward-line 1)))))
+  (point))
 
 (defun org-writenotes--extract-blocks (beg end org-file)
   "Parse lines between BEG and END into ordered checklist, ink_canvas, and paragraph blocks."
@@ -742,16 +752,30 @@ Supports positioning via:
 
                   ;; 3. Insert after a specific line (after a checklist item, checklist, paragraph, or sketch)
                   ((and (integerp after-line) (> after-line 0))
-                   (goto-char (point-min))
-                   (forward-line (1- after-line))
-                   (goto-char (min sub-end (line-end-position)))
-                   (insert (format "\n\n%s\n" link-str)))
+                   (let ((body-start (save-excursion
+                                       (org-writenotes--goto-body-start beg sub-end)
+                                       (point))))
+                     (goto-char (point-min))
+                     (forward-line (1- after-line))
+                     (let* ((line-end (min sub-end (line-end-position)))
+                            (ins-pos (max body-start line-end)))
+                       (goto-char ins-pos)
+                       (unless (bolp) (insert "\n"))
+                       (insert (format "%s\n\n" link-str)))))
 
                   ;; 4. Default: append at the end of the node body
                   (t
-                   (goto-char sub-end)
-                   (skip-chars-backward " \t\n")
-                   (insert (format "\n\n%s\n" link-str))))
+                   (let ((body-start (save-excursion
+                                       (org-writenotes--goto-body-start beg sub-end)
+                                       (point))))
+                     (goto-char sub-end)
+                     (skip-chars-backward " \t\n" body-start)
+                     (if (<= (point) body-start)
+                         (progn
+                           (goto-char body-start)
+                           (unless (bolp) (insert "\n"))
+                           (insert (format "%s\n\n" link-str)))
+                       (insert (format "\n\n%s\n" link-str))))))
                  (save-buffer)
                  (org-writenotes--refresh-inline-image abs-path)))
              (goto-char (cdr loc))
