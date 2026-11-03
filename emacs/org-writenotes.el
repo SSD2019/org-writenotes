@@ -82,6 +82,18 @@ All nodes share this directory so per-node subdirectories are not required."
 (defvar org-writenotes--clients nil
   "List of connected client process objects.")
 
+(defvar org-writenotes--bound-host nil
+  "Host the running server is actually bound to; drives token enforcement.")
+
+(defvar org-writenotes--rpc-json-cache nil
+  "Last `(TEXT . PARSED)' pair from `org-writenotes--read-rpc-json'.")
+
+(defvar org-writenotes--decoded-b64 nil
+  "Optional `(B64 . BYTES)' pair so `ink.commit' decodes its payload once.")
+
+(defvar org-writenotes--svgz-cache (make-hash-table :test 'equal)
+  "Maps sketch path to `(STAT META BASE64)' so unchanged sketches are not re-encoded.")
+
 (defvar org-writenotes--session-token nil
   "Random 256-bit hex authentication token for network pairing.")
 
@@ -787,9 +799,7 @@ When READ-ONLY is nil, ensures a stable `:ID:' is assigned if `org-writenotes-au
                       ht))
              (safe-end (min (point-max) (max beg end)))
              (subtree-text (buffer-substring-no-properties beg safe-end))
-             (etag (format "tick-%d-sha1-%s"
-                           (buffer-chars-modified-tick)
-                           (substring (sha1 subtree-text) 0 10)))
+             (etag (format "sha1-%s" (substring (sha1 subtree-text) 0 16)))
              (blocks (org-writenotes--extract-blocks beg body-end file))
              (subheadings (org-writenotes--extract-direct-subheadings beg end level))
              (check-total 0)
@@ -869,6 +879,25 @@ When READ-ONLY is nil, ensures a stable `:ID:' is assigned if `org-writenotes-au
     (let ((inner (match-string 1 line-str)))
       (vconcat (mapcar #'string-trim (split-string inner "|"))))))
 
+(defun org-writenotes--file-stat (path)
+  "Return `(MTIME . SIZE)' for PATH, or nil."
+  (let ((attrs (file-attributes path)))
+    (when attrs
+      (cons (file-attribute-modification-time attrs) (file-attribute-size attrs)))))
+
+(defun org-writenotes--svgz-cache-get (path)
+  "Return cached `(STAT META BASE64)' for PATH if the file is unchanged."
+  (let ((hit (gethash path org-writenotes--svgz-cache)))
+    (when (and hit (equal (car hit) (org-writenotes--file-stat path)))
+      hit)))
+
+(defun org-writenotes--svgz-cache-put (path meta b64)
+  "Remember META and B64 for the current on-disk state of PATH."
+  (when (> (hash-table-count org-writenotes--svgz-cache) 64)
+    (clrhash org-writenotes--svgz-cache))
+  (when-let* ((stat (org-writenotes--file-stat path)))
+    (puthash path (list stat meta b64) org-writenotes--svgz-cache)))
+
 (defun org-writenotes--extract-blocks (beg end org-file)
   "Parse lines between BEG and END into ordered content blocks.
 Blocks are checklist, ink_canvas, code_block, table or paragraph.
@@ -930,16 +959,22 @@ ORG-FILE is the file used to resolve sketch links."
                                      (let ((in-img-dir (expand-file-name (file-name-nondirectory rel-target)
                                                                          (org-writenotes--resolve-image-dir org-file))))
                                        (if (file-exists-p in-img-dir) in-img-dir abs-target))))
-                     (svgz-pair (when (file-exists-p abs-resolved)
-                                  (ignore-errors (org-writenotes--read-and-repair-svgz abs-resolved))))
+                     (cached (org-writenotes--svgz-cache-get abs-resolved))
+                     (svgz-pair (unless cached
+                                  (when (file-exists-p abs-resolved)
+                                    (ignore-errors (org-writenotes--read-and-repair-svgz abs-resolved)))))
                      (svgz-bytes (car svgz-pair))
                      (svg-xml (cdr svgz-pair))
-                     (meta (org-writenotes--extract-svg-meta svg-xml))
+                     (meta (if cached (nth 1 cached) (org-writenotes--extract-svg-meta svg-xml)))
                      (w (nth 0 meta))
                      (h (nth 1 meta))
                      (xr (nth 2 meta))
                      (yr (nth 3 meta))
-                     (b64 (when svgz-bytes (base64-encode-string svgz-bytes t))))
+                     (b64 (if cached
+                              (nth 2 cached)
+                            (when svgz-bytes (base64-encode-string svgz-bytes t))))
+                     (_ (when (and (not cached) b64)
+                          (org-writenotes--svgz-cache-put abs-resolved meta b64))))
                 (push `(:blockId ,(format "blk-%d" blk-idx)
                         :type "ink_canvas"
                         :startLine ,line-num
@@ -1609,11 +1644,11 @@ Supports `mode' (\"paragraph\" or \"checklist\"), `text', and optional `fileName
                   ;; Skip past any :WRITENOTES_OCR: drawer if present
                   (save-excursion
                     (forward-line 1)
-                    (when (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n\\(?:.\\|\n\\)*?^\\s-*:END:\\s-*$")
+                    (when (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n[^z-a]*?^\\s-*:END:\\s-*$")
                       (goto-char (match-end 0))))
                   (when (save-excursion
                           (forward-line 1)
-                          (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n\\(?:.\\|\n\\)*?^\\s-*:END:\\s-*$"))
+                          (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n[^z-a]*?^\\s-*:END:\\s-*$"))
                     (forward-line 1)
                     (re-search-forward "^\\s-*:END:\\s-*$" body-end t))
                   (end-of-line)
@@ -1950,7 +1985,7 @@ If BARE-FILENAME is given, also clean up child headings matching OCR for that fi
   (save-excursion
     (skip-chars-forward " \t\n")
     (beginning-of-line)
-    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n\\(?:.\\|\n\\)*?^[ \t]*:END:[ \t]*\n?"))
+    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n[^z-a]*?^[ \t]*:END:[ \t]*\n?"))
       (while (looking-at drawer-re)
         (replace-match "" t t))))
   ;; 2. Remove any directly following OCR heading (e.g. "** OCR", "** OCR: ...", or "** Handwriting OCR")
@@ -2141,7 +2176,10 @@ if OCR text is provided."
            (img-dir (org-writenotes--resolve-image-dir org-file))
            (bare-filename (file-name-nondirectory filename))
            (abs-path (expand-file-name bare-filename img-dir))
-           (raw-bytes (base64-decode-string b64)))
+           (raw-bytes (if (and org-writenotes--decoded-b64
+                                  (eq (car org-writenotes--decoded-b64) b64))
+                             (cdr org-writenotes--decoded-b64)
+                           (base64-decode-string b64))))
       (remhash abs-path org-writenotes--live-svg-cache)
       (org-writenotes--write-raw-bytes abs-path raw-bytes)
       ;; Update folded :WRITENOTES_OCR: drawer beneath the link in the Org buffer
@@ -2160,7 +2198,7 @@ if OCR text is provided."
                   (save-excursion
                     (skip-chars-forward " \t\n")
                     (beginning-of-line)
-                    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n\\(?:.\\|\n\\)*?^[ \t]*:END:[ \t]*\n?"))
+                    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n[^z-a]*?^[ \t]*:END:[ \t]*\n?"))
                       (while (looking-at drawer-re)
                         (setq had-drawer t)
                         (replace-match "" t t))))
@@ -2293,28 +2331,55 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
        :method ,method
        :params ,params-plist))))
 
+(defun org-writenotes--read-rpc-json (text)
+  "Parse JSON-RPC TEXT into an alist, reusing the result for the same string object."
+  (if (and org-writenotes--rpc-json-cache (eq (car org-writenotes--rpc-json-cache) text))
+      (cdr org-writenotes--rpc-json-cache)
+    (let ((parsed (json-parse-string text :object-type 'alist :array-type 'list
+                                     :null-object nil :false-object :json-false)))
+      (setq org-writenotes--rpc-json-cache (cons text parsed))
+      parsed)))
+
+(defun org-writenotes--register-client (proc)
+  "Add authenticated PROC to the broadcast list and push the active node to it."
+  (cl-pushnew proc org-writenotes--clients)
+  (message "[Org-WriteNotes] Tablet connected!")
+  (when (and org-writenotes--active-node-id (process-live-p proc))
+    (let ((loc (org-writenotes--locate-node org-writenotes--active-node-id)))
+      (when loc
+        (with-current-buffer (car loc)
+          (save-excursion
+            (goto-char (cdr loc))
+            (org-writenotes--ws-send-json
+             proc
+             `(:jsonrpc "2.0"
+               :method "emacs.focusNode"
+               :params ,(org-writenotes--parse-subtree-at-point)))))))))
+
 (defun org-writenotes--dispatch-rpc (proc msg-text)
   "Handle an incoming JSON-RPC 2.0 request MSG-TEXT from client PROC."
   (let (req-id)
     (condition-case err
-        (let* ((json-object-type 'alist)
-               (json-array-type 'list)
-               (json-key-type 'symbol)
-               (req (json-read-from-string msg-text))
+        (let* ((req (org-writenotes--read-rpc-json msg-text))
                (id (alist-get 'id req))
                (method (alist-get 'method req))
                (params (alist-get 'params req))
                (result nil))
           (setq req-id id)
+          (unless (or (equal method "session.hello") (process-get proc :authed))
+            (error "Not authenticated: send session.hello first"))
           (setq result
                 (pcase method
                   ("session.hello"
                    (let ((token (alist-get 'token params)))
                      ;; Validate token on non-loopback bindings
-                     (when (and (not (member org-writenotes-host '("127.0.0.1" "localhost")))
+                     (when (and (not (member (or org-writenotes--bound-host org-writenotes-host)
+                                            '("127.0.0.1" "localhost")))
                                 org-writenotes--session-token
                                 (not (equal token org-writenotes--session-token)))
                        (error "Authentication failed: invalid session token"))
+                     (process-put proc :authed t)
+                     (run-at-time 0 nil #'org-writenotes--register-client proc)
                      `(:emacsVersion ,emacs-version
                        :orgVersion ,(org-version)
                        :imageDir ,org-writenotes-image-dir
@@ -2387,11 +2452,43 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
             :id ,req-id
             :error (:code -32603 :message ,(error-message-string err)))))))))
 
+(defconst org-writenotes--ws-max-frame-bytes (* 64 1024 1024)
+  "Largest WebSocket frame accepted from a client.")
+
+(defun org-writenotes--ws-frame-needed (buf)
+  "Return the total byte count of the frame starting BUF, or nil if its header is incomplete."
+  (when (>= (length buf) 2)
+    (let* ((b1 (logand (aref buf 1) #xff))
+           (len-indicator (logand b1 #x7f))
+           (mask-len (if (/= (logand b1 #x80) 0) 4 0)))
+      (cond
+       ((< len-indicator 126) (+ 2 mask-len len-indicator))
+       ((= len-indicator 126)
+        (when (>= (length buf) 4)
+          (+ 4 mask-len (ash (logand (aref buf 2) #xff) 8) (logand (aref buf 3) #xff))))
+       (t
+        (when (>= (length buf) 10)
+          (+ 10 mask-len
+             (ash (logand (aref buf 6) #xff) 24) (ash (logand (aref buf 7) #xff) 16)
+             (ash (logand (aref buf 8) #xff) 8) (logand (aref buf 9) #xff))))))))
+
 (defun org-writenotes--client-filter (proc chunk)
   "Network filter for WebSocket handshake and frame decoding on PROC.
-CHUNK is the newly received data."
-  (let ((buf (concat (string-as-unibyte (or (process-get proc :recv-buf) (unibyte-string)))
-                     (string-as-unibyte chunk))))
+CHUNK is the newly received data.  Incoming chunks are queued until the
+current frame is complete, so large frames are joined once, not per chunk."
+  (let* ((chunk (string-as-unibyte chunk))
+         (pending (process-get proc :recv-chunks))
+         (total (+ (or (process-get proc :recv-len) 0) (length chunk)))
+         (need (process-get proc :recv-need)))
+    (if (and need (< total need))
+        (progn (process-put proc :recv-chunks (cons chunk pending))
+               (process-put proc :recv-len total))
+      (org-writenotes--client-process-buffer
+       proc (apply #'concat (nreverse (cons chunk pending)))))))
+
+(defun org-writenotes--client-process-buffer (proc buf)
+  "Handshake and decode frames from BUF received on PROC; keep the remainder queued."
+  (progn
     (when (not (process-get proc :ws-upgraded))
       ;; Perform HTTP Upgrade -> WebSocket Handshake
       (when (string-match "\r\n\r\n" buf)
@@ -2408,23 +2505,10 @@ CHUNK is the newly received data."
                             (format "Sec-WebSocket-Accept: %s\r\n\r\n" accept))))
                 (process-put proc :ws-upgraded t)
                 (setq buf (string-as-unibyte rest))
-                (process-put proc :recv-buf buf)
-                (process-send-string proc resp)
-                (cl-pushnew proc org-writenotes--clients)
-                (message "[Org-WriteNotes] Tablet connected!")
-                ;; Immediately send active node snapshot if one is already focused
-                (when org-writenotes--active-node-id
-                  (let ((loc (org-writenotes--locate-node org-writenotes--active-node-id)))
-                    (when loc
-                      (with-current-buffer (car loc)
-                        (save-excursion
-                          (goto-char (cdr loc))
-                          (org-writenotes--ws-send-json
-                           proc
-                           `(:jsonrpc "2.0"
-                             :method "emacs.focusNode"
-                             :params ,(org-writenotes--parse-subtree-at-point)))))))))
-            (delete-process proc)))))
+                (process-send-string proc resp))
+            (delete-process proc))))
+      (when (and (not (process-get proc :ws-upgraded)) (> (length buf) 16384))
+        (delete-process proc)))
     ;; Decode RFC 6455 frames once upgraded
     (when (and (process-live-p proc) (process-get proc :ws-upgraded))
       (let ((continue t))
@@ -2454,7 +2538,13 @@ CHUNK is the newly received data."
                      proc
                      (concat (unibyte-string #x8a pong-len) pong-bytes)))))))))))
     (when (process-live-p proc)
-      (process-put proc :recv-buf buf))))
+      (let ((need (and (process-get proc :ws-upgraded)
+                       (org-writenotes--ws-frame-needed buf))))
+        (if (and need (> need org-writenotes--ws-max-frame-bytes))
+            (delete-process proc)
+          (process-put proc :recv-chunks (and (> (length buf) 0) (list buf)))
+          (process-put proc :recv-len (length buf))
+          (process-put proc :recv-need need))))))
 
 (defun org-writenotes--client-sentinel (proc event)
   "Clean up disconnected client PROC on EVENT."
@@ -2530,7 +2620,7 @@ When VERBOSE is non-nil, report the outcome."
     (delete-process org-writenotes--server-proc))
   (unless org-writenotes--session-token
     (setq org-writenotes--session-token
-          (substring (secure-hash 'sha256 (format "%s-%s" (random) (current-time-string))) 0 32)))
+          (substring (secure-hash 'sha256 (format "%s-%s-%s" (random t) (current-time-string) (emacs-pid))) 0 32)))
   (setq org-writenotes--server-proc
         (make-network-process
          :name "org-writenotes-server"
@@ -2542,6 +2632,7 @@ When VERBOSE is non-nil, report the outcome."
          :noquery t
          :filter #'org-writenotes--client-filter
          :sentinel #'org-writenotes--client-sentinel))
+  (setq org-writenotes--bound-host org-writenotes-host)
   (org-writenotes--start-adb-watchdog)
   (org-writenotes--ensure-adb-reverse-async nil)
   (message "[Org-WriteNotes] Server listening on ws://%s:%d"
@@ -2576,10 +2667,12 @@ When VERBOSE is non-nil, report the outcome."
 (defun org-writenotes-pair-qr ()
   "Display a LAN / Tailscale pairing QR code and JSON payload for wireless tablet connection."
   (interactive)
-  (let ((org-writenotes-host "0.0.0.0"))
-    (unless (and org-writenotes--server-proc
-                 (process-live-p org-writenotes--server-proc))
-      (org-writenotes-start-server)))
+  (unless (and org-writenotes--server-proc
+               (process-live-p org-writenotes--server-proc)
+               (equal org-writenotes--bound-host "0.0.0.0"))
+    ;; Bind persistently so the hello handler enforces the session token.
+    (setq org-writenotes-host "0.0.0.0")
+    (org-writenotes-start-server))
   (let* ((lan-ip (string-trim
                   (shell-command-to-string
                    "hostname -I 2>/dev/null | awk '{print $1}'")))
@@ -2852,6 +2945,8 @@ connected tablet for stylus annotation."
                      (length orphans) trash-dir)))))))
 
 (defvar org-writenotes--last-followed-node nil)
+(defvar org-writenotes--last-follow-key nil
+  "`(BUFFER HEADING-POS TICK)' of the last follow check, to skip redundant work.")
 
 (defun org-writenotes--follow-post-command ()
   "Automatically push the Org node at point when moving between headings."
@@ -2859,7 +2954,12 @@ connected tablet for stylus annotation."
       (when (and (derived-mode-p 'org-mode)
                  org-writenotes--clients
                  (save-excursion (ignore-errors (org-back-to-heading t))))
-        (let ((nid (save-excursion (ignore-errors (org-writenotes--node-id-at-point)))))
+        (let* ((key (list (current-buffer)
+                          (save-excursion (ignore-errors (org-back-to-heading t)) (point))
+                          (buffer-chars-modified-tick)))
+               (nid (unless (equal key org-writenotes--last-follow-key)
+                      (setq org-writenotes--last-follow-key key)
+                      (save-excursion (ignore-errors (org-writenotes--node-id-at-point))))))
           (when (and nid (not (equal nid org-writenotes--last-followed-node)))
             (setq org-writenotes--last-followed-node nid)
             (save-excursion
@@ -2909,7 +3009,7 @@ connected tablet for stylus annotation."
           (save-excursion
             (goto-char (cdr loc))
             (org-back-to-heading t)
-            (let ((snapshot (org-writenotes--parse-subtree-at-point)))
+            (let ((snapshot (org-writenotes--parse-subtree-at-point t)))
               (setq org-writenotes--last-active-etag (plist-get snapshot :etag))
               (org-writenotes--broadcast-notification "emacs.nodeModified" snapshot))))))))
 

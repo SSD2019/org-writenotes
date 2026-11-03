@@ -35,6 +35,10 @@
   "Failed `session.hello' token attempts allowed before a client is dropped."
   :type 'integer :group 'org-writenotes)
 
+(defcustom org-writenotes-sketch-history-min-interval 30
+  "Minimum seconds between history snapshots of the same sketch."
+  :type 'integer :group 'org-writenotes)
+
 (defcustom org-writenotes-sketch-history-depth 20
   "Number of historical snapshots kept per sketch in `.history/'.  0 disables."
   :type 'integer :group 'org-writenotes)
@@ -77,9 +81,15 @@
                            "\\.[0-9T]+\\'"))
             #'string>))))
 
-(defun org-writenotes--snapshot-sketch (abs-path)
+(defun org-writenotes--snapshot-sketch (abs-path &optional force)
   "Copy existing ABS-PATH into history and prune to the configured depth."
-  (when (and (> org-writenotes-sketch-history-depth 0) (file-exists-p abs-path))
+  (when (and (> org-writenotes-sketch-history-depth 0)
+             (file-exists-p abs-path)
+             (let ((newest (car (org-writenotes--list-snapshots abs-path))))
+               (or force (null newest)
+                   (>= (float-time (time-since (file-attribute-modification-time
+                                                (file-attributes newest))))
+                       org-writenotes-sketch-history-min-interval))))
     (let* ((dir (org-writenotes--history-dir abs-path))
            (dest (expand-file-name
                   (format "%s.%s" (file-name-nondirectory abs-path)
@@ -114,7 +124,7 @@
   "Restore snapshot file SNAP over sketch ABS; return restored bytes."
   (unless (file-exists-p snap) (error "Snapshot not found: %s" snap))
   (let ((bytes (org-writenotes--read-raw-bytes snap)))
-    (org-writenotes--snapshot-sketch abs)
+    (org-writenotes--snapshot-sketch abs t)
     (remhash abs org-writenotes--live-svg-cache)
     (org-writenotes--write-raw-bytes abs bytes)
     (org-writenotes--refresh-inline-image abs)
@@ -178,7 +188,9 @@ PARAMS is the RPC parameter alist."
           :bytesWritten ,(length new-bytes))))
      (t
       (unless (equal disk-etag new-etag) (org-writenotes--snapshot-sketch abs))
-      (append (funcall orig params) `(:etag ,new-etag))))))
+      (append (let ((org-writenotes--decoded-b64 (cons b64 new-bytes)))
+                (funcall orig params))
+              `(:etag ,new-etag))))))
 
 (advice-add 'org-writenotes--handle-ink-commit :around
             #'org-writenotes--ink-commit-around)
@@ -195,15 +207,16 @@ PARAMS is the RPC parameter alist."
 (defun org-writenotes--dispatch-rpc-around (orig proc msg-text)
   "Handle extra methods and augment `session.hello' before calling ORIG.
 PROC is the client process and MSG-TEXT the raw message."
-  (let* ((req (ignore-errors
-                (let ((json-object-type 'alist) (json-array-type 'list)
-                      (json-key-type 'symbol))
-                  (json-read-from-string msg-text))))
+  (let* ((req (ignore-errors (org-writenotes--read-rpc-json msg-text)))
          (id (alist-get 'id req))
          (method (alist-get 'method req))
          (params (alist-get 'params req))
          (extra (assoc method org-writenotes--extra-rpc-methods)))
     (cond
+     ((and extra (not (process-get proc :authed)))
+      (org-writenotes--ws-send-json
+       proc `(:jsonrpc "2.0" :id ,id
+              :error (:code -32001 :message "Not authenticated: send session.hello first"))))
      (extra
       (org-writenotes--ws-send-json
        proc
@@ -511,10 +524,7 @@ advising `org-writenotes--create-image-svgz-advice' or `create-image'."
 (defun org-writenotes--presence-around (orig proc msg-text)
   "Track which client is on which node, then call ORIG.
 PROC is the client process and MSG-TEXT the raw JSON-RPC message."
-  (let* ((req (ignore-errors
-                (let ((json-object-type 'alist) (json-array-type 'list)
-                      (json-key-type 'symbol))
-                  (json-read-from-string msg-text))))
+  (let* ((req (ignore-errors (org-writenotes--read-rpc-json msg-text)))
          (method (alist-get 'method req))
          (params (alist-get 'params req))
          (node (and (listp params) (alist-get 'nodeId params)))

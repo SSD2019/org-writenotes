@@ -25,7 +25,8 @@
 (ert-deftest org-writenotes-extras-history-prune ()
   (org-writenotes-test--with-dir d
     (let ((f (expand-file-name "a.svgz" d))
-          (org-writenotes-sketch-history-depth 3))
+          (org-writenotes-sketch-history-depth 3)
+          (org-writenotes-sketch-history-min-interval 0))
       (dotimes (i 5)
         (org-writenotes--write-raw-bytes f (format "v%d" i))
         (org-writenotes--snapshot-sketch f)
@@ -180,3 +181,19 @@
 
 (provide 'org-writenotes-extras-test)
 ;;; org-writenotes-extras-test.el ends here
+
+(ert-deftest org-writenotes-extras-unauthenticated-rpc-rejected ()
+  (let (sent)
+    (cl-letf (((symbol-function 'org-writenotes--ws-send-json)
+               (lambda (_p payload) (push payload sent)))
+              ((symbol-function 'process-get) (lambda (&rest _) nil)))
+      (org-writenotes--dispatch-rpc 'fake "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"node.list\"}")
+      (should (plist-get (car sent) :error))
+      (setq sent nil)
+      (org-writenotes--dispatch-rpc 'fake "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"presence.list\"}")
+      (should (plist-get (car sent) :error)))))
+
+(ert-deftest org-writenotes-extras-ws-frame-needed ()
+  (let ((frame (org-writenotes--ws-encode-frame (make-string 300 ?a))))
+    (should (null (org-writenotes--ws-frame-needed (substring frame 0 3))))
+    (should (= (org-writenotes--ws-frame-needed (substring frame 0 4)) (length frame)))))
