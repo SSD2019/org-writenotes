@@ -77,6 +77,31 @@
       (should (cl-some (lambda (b) (equal (plist-get b :type) "code_block")) blocks))
       (should (cl-some (lambda (b) (equal (plist-get b :type) "table")) blocks)))))
 
+(ert-deftest org-writenotes-test-parse-sketch-after-paragraph ()
+  "Verify inserting and parsing a sketch link after a paragraph does not clobber match-data."
+  (let* ((tmp-dir (make-temp-file "org-wn-sketch-test-" t))
+         (tmp-svgz (expand-file-name "test-sketch.svgz" tmp-dir)))
+    (unwind-protect
+        (progn
+          (org-writenotes--create-blank-svgz tmp-svgz 1200 600 40 40)
+          (with-temp-buffer
+            (org-mode)
+            (setq buffer-file-name (expand-file-name "test.org" tmp-dir))
+            (insert "* TODO Node with Sketch\n"
+                    ":PROPERTIES:\n:ID: test-sketch-node-1\n:END:\n"
+                    "Leading paragraph before the sketch.\n"
+                    (format "[[file:%s]]\n" tmp-svgz)
+                    "\nTrailing paragraph.\n")
+            (goto-char (point-min))
+            (let* ((snap (org-writenotes--parse-subtree-at-point))
+                   (blocks (append (plist-get snap :blocks) nil)))
+              (should (= (length blocks) 3))
+              (should (equal (plist-get (nth 0 blocks) :type) "paragraph"))
+              (should (equal (plist-get (nth 1 blocks) :type) "ink_canvas"))
+              (should (equal (plist-get (nth 1 blocks) :fileName) "test-sketch.svgz"))
+              (should (equal (plist-get (nth 2 blocks) :type) "paragraph")))))
+      (delete-directory tmp-dir t))))
+
 (ert-deftest org-writenotes-test-checklist-and-table-mutations ()
   "Verify checklist partial state, checklist item edit/indent, and table cell update."
   (let ((tmp-org (make-temp-file "org-wn-mut-" nil ".org"))

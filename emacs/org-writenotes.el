@@ -931,15 +931,16 @@ ORG-FILE is the file used to resolve sketch links."
                      curr-checklist-end nil)))
            (flush-para ()
              (when curr-para
-               (let ((txt (string-trim (mapconcat #'identity (nreverse curr-para) "\n"))))
-                 (unless (string-empty-p txt)
-                   (cl-incf blk-idx)
-                   (push `(:blockId ,(format "blk-%d" blk-idx)
-                           :type "paragraph"
-                           :startLine ,curr-para-start
-                           :endLine ,(or curr-para-end curr-para-start)
-                           :text ,txt)
-                         blocks)))
+               (save-match-data
+                 (let ((txt (string-trim (mapconcat #'identity (nreverse curr-para) "\n"))))
+                   (unless (string-empty-p txt)
+                     (cl-incf blk-idx)
+                     (push `(:blockId ,(format "blk-%d" blk-idx)
+                             :type "paragraph"
+                             :startLine ,curr-para-start
+                             :endLine ,(or curr-para-end curr-para-start)
+                             :text ,txt)
+                           blocks))))
                (setq curr-para nil
                      curr-para-start nil
                      curr-para-end nil))))
@@ -951,89 +952,89 @@ ORG-FILE is the file used to resolve sketch links."
             (cond
              ;; Case 1: Embedded .svgz / .svg Ink Block Link
              ((string-match "\\[\\[\\(?:file:\\|attachment:\\)?\\([^]\n]+\\.svgz?\\)\\(?:\\]\\[[^]\n]*\\)?\\]\\]" line-str)
-              (flush-checklist)
-              (flush-para)
-              (cl-incf blk-idx)
-              (let* ((full-link-str (match-string 0 line-str))
-                     (rel-target (match-string 1 line-str))
-                     (abs-target (expand-file-name rel-target (file-name-directory (expand-file-name org-file))))
-                     (abs-resolved (if (file-exists-p abs-target)
-                                       abs-target
-                                     (let ((in-img-dir (expand-file-name (file-name-nondirectory rel-target)
-                                                                         (org-writenotes--resolve-image-dir org-file))))
-                                       (if (file-exists-p in-img-dir) in-img-dir abs-target))))
-                     (cached (org-writenotes--svgz-cache-get abs-resolved))
-                     (svgz-pair (unless cached
-                                  (when (file-exists-p abs-resolved)
-                                    (ignore-errors (org-writenotes--read-and-repair-svgz abs-resolved)))))
-                     (svgz-bytes (car svgz-pair))
-                     (svg-xml (cdr svgz-pair))
-                     (meta (if cached (nth 1 cached) (org-writenotes--extract-svg-meta svg-xml)))
-                     (w (nth 0 meta))
-                     (h (nth 1 meta))
-                     (xr (nth 2 meta))
-                     (yr (nth 3 meta))
-                     (b64 (if cached
-                              (nth 2 cached)
-                            (when svgz-bytes (base64-encode-string svgz-bytes t))))
-                     (_ (when (and (not cached) b64)
-                          (org-writenotes--svgz-cache-put abs-resolved meta b64))))
-                (push `(:blockId ,(format "blk-%d" blk-idx)
-                        :type "ink_canvas"
-                        :startLine ,line-num
-                        :endLine ,line-num
-                        :fileName ,(file-name-nondirectory abs-resolved)
-                        :linkText ,full-link-str
-                        :width ,w
-                        :height ,h
-                        :xRuling ,xr
-                        :yRuling ,yr
-                        :svgzBase64 ,(or b64 :null))
-                      blocks)))
+              (let ((full-link-str (match-string 0 line-str))
+                    (rel-target (match-string 1 line-str)))
+                (flush-checklist)
+                (flush-para)
+                (cl-incf blk-idx)
+                (let* ((abs-target (expand-file-name rel-target (file-name-directory (expand-file-name org-file))))
+                       (abs-resolved (if (file-exists-p abs-target)
+                                         abs-target
+                                       (let ((in-img-dir (expand-file-name (file-name-nondirectory rel-target)
+                                                                           (org-writenotes--resolve-image-dir org-file))))
+                                         (if (file-exists-p in-img-dir) in-img-dir abs-target))))
+                       (cached (org-writenotes--svgz-cache-get abs-resolved))
+                       (svgz-pair (unless cached
+                                    (when (file-exists-p abs-resolved)
+                                      (ignore-errors (org-writenotes--read-and-repair-svgz abs-resolved)))))
+                       (svgz-bytes (car svgz-pair))
+                       (svg-xml (cdr svgz-pair))
+                       (meta (if cached (nth 1 cached) (org-writenotes--extract-svg-meta svg-xml)))
+                       (w (nth 0 meta))
+                       (h (nth 1 meta))
+                       (xr (nth 2 meta))
+                       (yr (nth 3 meta))
+                       (b64 (if cached
+                                (nth 2 cached)
+                              (when svgz-bytes (base64-encode-string svgz-bytes t))))
+                       (_ (when (and (not cached) b64)
+                            (org-writenotes--svgz-cache-put abs-resolved meta b64))))
+                  (push `(:blockId ,(format "blk-%d" blk-idx)
+                          :type "ink_canvas"
+                          :startLine ,line-num
+                          :endLine ,line-num
+                          :fileName ,(file-name-nondirectory abs-resolved)
+                          :linkText ,full-link-str
+                          :width ,w
+                          :height ,h
+                          :xRuling ,xr
+                          :yRuling ,yr
+                          :svgzBase64 ,(or b64 :null))
+                        blocks))))
 
              ;; Case 1.5: Org Source Code Block (#+BEGIN_SRC <lang> ... #+END_SRC)
              ((let ((case-fold-search t))
                 (string-match "^\\s-*#\\+BEGIN_SRC\\(?:\\s-+\\([^ \t\n]+\\)\\)?\\(.*\\)$" line-str))
-              (flush-checklist)
-              (flush-para)
-              (let ((lang (or (match-string 1 line-str) "text"))
-                    (src-start line-num)
-                    (src-end line-num)
-                    (code-lines nil)
-                    (results-text nil))
-                (forward-line 1)
-                (while (and (< (point) lim)
-                            (not (let ((case-fold-search t))
-                                   (looking-at-p "^\\s-*#\\+END_SRC\\b"))))
-                  (push (buffer-substring-no-properties (line-beginning-position) (line-end-position))
-                        code-lines)
-                  (forward-line 1))
-                (setq src-end (line-number-at-pos (point)))
-                ;; Check if followed by #+RESULTS:
-                (save-excursion
+              (let ((lang (or (match-string 1 line-str) "text")))
+                (flush-checklist)
+                (flush-para)
+                (let ((src-start line-num)
+                      (src-end line-num)
+                      (code-lines nil)
+                      (results-text nil))
                   (forward-line 1)
-                  (while (and (< (point) lim) (looking-at-p "^\\s-*$"))
+                  (while (and (< (point) lim)
+                              (not (let ((case-fold-search t))
+                                     (looking-at-p "^\\s-*#\\+END_SRC\\b"))))
+                    (push (buffer-substring-no-properties (line-beginning-position) (line-end-position))
+                          code-lines)
                     (forward-line 1))
-                  (let ((case-fold-search t))
-                    (when (and (< (point) lim) (looking-at-p "^\\s-*#\\+RESULTS:"))
-                      (forward-line 1)
-                      (let ((res-lines nil))
-                        (while (and (< (point) lim)
-                                    (looking-at "^\\s-*\\(?::\\s-?\\(.*\\)\\|#\\+\\(?:BEGIN_EXAMPLE\\|END_EXAMPLE\\)\\)"))
-                          (when (match-string 1)
-                            (push (match-string 1) res-lines))
-                          (forward-line 1))
-                        (when res-lines
-                          (setq results-text (mapconcat #'identity (nreverse res-lines) "\n")))))))
-                (cl-incf blk-idx)
-                (push `(:blockId ,(format "blk-%d" blk-idx)
-                        :type "code_block"
-                        :startLine ,src-start
-                        :endLine ,src-end
-                        :language ,lang
-                        :code ,(mapconcat #'identity (nreverse code-lines) "\n")
-                        :results ,(or results-text :null))
-                      blocks)))
+                  (setq src-end (line-number-at-pos (point)))
+                  ;; Check if followed by #+RESULTS:
+                  (save-excursion
+                    (forward-line 1)
+                    (while (and (< (point) lim) (looking-at-p "^\\s-*$"))
+                      (forward-line 1))
+                    (let ((case-fold-search t))
+                      (when (and (< (point) lim) (looking-at-p "^\\s-*#\\+RESULTS:"))
+                        (forward-line 1)
+                        (let ((res-lines nil))
+                          (while (and (< (point) lim)
+                                      (looking-at "^\\s-*\\(?::\\s-?\\(.*\\)\\|#\\+\\(?:BEGIN_EXAMPLE\\|END_EXAMPLE\\)\\)"))
+                            (when (match-string 1)
+                              (push (match-string 1) res-lines))
+                            (forward-line 1))
+                          (when res-lines
+                            (setq results-text (mapconcat #'identity (nreverse res-lines) "\n")))))))
+                  (cl-incf blk-idx)
+                  (push `(:blockId ,(format "blk-%d" blk-idx)
+                          :type "code_block"
+                          :startLine ,src-start
+                          :endLine ,src-end
+                          :language ,lang
+                          :code ,(mapconcat #'identity (nreverse code-lines) "\n")
+                          :results ,(or results-text :null))
+                        blocks))))
 
              ;; Case 1.8: Org Table (| col1 | col2 |)
              ((string-match-p "^\\s-*|.*|\\s-*$" line-str)
@@ -1062,20 +1063,20 @@ ORG-FILE is the file used to resolve sketch links."
 
              ;; Case 2: Org Checklist Item (- [ ] or - [X] or - [-])
              ((string-match "^\\(\\s-*[-+*]\\s-+\\)\\[\\([ Xx-]\\)\\]\\s-+\\(.*\\)$" line-str)
-              (flush-para)
-              (unless curr-checklist-start
-                (setq curr-checklist-start line-num))
-              (setq curr-checklist-end line-num)
               (let ((mark (upcase (match-string 2 line-str)))
-                    (item-text (match-string 3 line-str))
-                    (idx (length curr-checklist)))
-                (push `(:index ,idx
-                        :line ,line-num
-                        :state ,(cond ((string= mark "X") "checked")
-                                      ((string= mark "-") "partial")
-                                      (t "unchecked"))
-                        :text ,item-text)
-                      curr-checklist)))
+                    (item-text (match-string 3 line-str)))
+                (flush-para)
+                (unless curr-checklist-start
+                  (setq curr-checklist-start line-num))
+                (setq curr-checklist-end line-num)
+                (let ((idx (length curr-checklist)))
+                  (push `(:index ,idx
+                          :line ,line-num
+                          :state ,(cond ((string= mark "X") "checked")
+                                        ((string= mark "-") "partial")
+                                        (t "unchecked"))
+                          :text ,item-text)
+                        curr-checklist))))
 
              ;; Case 2.5: Skip folded :WRITENOTES_OCR: drawer so it does not appear as a raw paragraph
              ((string-match-p "^\\s-*:WRITENOTES_OCR:\\s-*$" line-str)
