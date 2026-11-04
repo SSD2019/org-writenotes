@@ -137,5 +137,55 @@
         (should-not (string-match-p "<rect[^>]*<rect" dark-adapted))
         (should-not (string-match-p "fill=\"#FFFDF8\"" dark-adapted))))))
 
+;; Agenda must return only what Emacs' own day agenda shows, not every TODO.
+(ert-deftest org-writenotes-test-agenda-only-today ()
+  "Verify the agenda filter returns today's, overdue and timed entries only."
+  (let* ((tmp (make-temp-file "org-wn-agenda-" nil ".org"))
+         (today (format-time-string "%Y-%m-%d %a")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert "* TODO Today task\nSCHEDULED: <" today ">\n"
+                    "* TODO Overdue thing\nSCHEDULED: <2020-01-01 Wed>\n"
+                    "* TODO Meeting\n<" today " 14:30>\n"
+                    "* TODO Far future\nSCHEDULED: <2099-05-01 Fri>\n"
+                    "* TODO Undated task\n"))
+          (let* ((org-agenda-files (list tmp))
+                 (nodes (append (org-writenotes--collect-node-summaries "agenda" nil nil) nil))
+                 (titles (mapcar (lambda (n) (plist-get n :title)) nodes)))
+            ;; Timed entry sorts first.
+            (should (equal (car titles) "Meeting"))
+            (should (equal (plist-get (car nodes) :agendaLabel) "14:30"))
+            (should (member "Today task" titles))
+            (should (member "Overdue thing" titles))
+            (should-not (member "Far future" titles))
+            (should-not (member "Undated task" titles))))
+      (let ((buf (find-buffer-visiting tmp)))
+        (when buf (kill-buffer buf)))
+      (delete-file tmp))))
+
+(ert-deftest org-writenotes-test-search-capped-and-deduped ()
+  "Verify search matches body text once per heading and honours the result cap."
+  (let ((tmp (make-temp-file "org-wn-search-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert "* Banana heading\nbanana banana banana\n"
+                    "** Child\nmentions banana\n"
+                    "* Other\nnothing here\n")
+            (dotimes (i 30) (insert (format "* Fruit %d\nbanana\n" i))))
+          (let ((org-agenda-files (list tmp)))
+            (let ((titles (mapcar (lambda (n) (plist-get n :title))
+                                  (org-writenotes--collect-node-summaries "search" "banana"))))
+              (should (equal (seq-take titles 2) '("Banana heading" "Child")))
+              (should-not (member "Other" titles))
+              (should (= (length titles) (length (delete-dups (copy-sequence titles))))))
+            (let ((org-writenotes-search-max-results 5))
+              (should (= 5 (length (org-writenotes--collect-node-summaries "search" "banana")))))
+            (should (= 0 (length (org-writenotes--collect-node-summaries "search" "b"))))))
+      (let ((buf (find-buffer-visiting tmp)))
+        (when buf (kill-buffer buf)))
+      (delete-file tmp))))
+
 (provide 'org-writenotes-test)
 ;;; org-writenotes-test.el ends here

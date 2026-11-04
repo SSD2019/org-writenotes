@@ -14,11 +14,14 @@ Write structured notes, manage tasks, execute Babel code blocks, and sketch high
   - **Pen Tips & Presets:** Ballpoint, Fountain, Brush, Chisel (configurable angle), Highlighter, and 6 customizable one-tap **Favorite Pen Slots**.
   - **Ruled & Standard Eraser:** Erase whole strokes or snap-erase along ruling lines.
   - **Lasso Selection & Restyling:** Freeform lasso with move, scale, rotate, duplicate, cross-sketch copy/paste, and live stroke recoloring/rewidening.
+  - **Cross-Sketch Clipboard:** Copy or cut strokes in one sketch and paste them into any other; the clipboard survives app restarts, a **Paste (N)** button appears in the toolbar, and pasted strokes land in the visible part of the target sketch.
   - **Hold-to-Snap Geometric Shapes:** Pause 400 ms at the end of a stroke to snap freehand lines, arrows, axis-aligned rectangles, or circles/ellipses (with optional grid snapping).
   - **Laser Pointer Mode:** Stream a live glowing pointer trail to your Emacs buffer during presentations or screen sharing without modifying the saved `.svgz`.
 - **Hardware Stylus & Touch Ergonomics:**
   - **Palm Rejection & Stylus-Only Mode:** Single-finger scrolling passes cleanly through inline canvases; holding the S-Pen barrel button temporarily engages Lasso Select.
   - **Procreate-Style Multi-Touch Gestures:** Two-finger tap to **Undo**, three-finger tap to **Redo**, and pinch-to-zoom with a live **Viewport Minimap** navigator.
+  - **Radial Pen Menu:** Hold the barrel button while the pen hovers (not touching) to open Pen / Eraser / Lasso / Undo / Redo and your favorite pens around the pen tip.
+  - **Toolbar Layout:** Dock the sketch toolbar at the top or bottom, or use a draggable, collapsible floating palette in the full-screen editor; **Left-handed mode** mirrors the sidebar, rail and palette.
   - **Stroke Tuning:** Configurable stroke smoothing, pressure gamma curve, and tilt sensitivity.
 - **Dynamic Canvas & Paper Templates:**
   - Automatic vertical canvas expansion as you write near the bottom edge, plus one-tap **Trim Bottom Whitespace**.
@@ -41,8 +44,11 @@ Write structured notes, manage tasks, execute Babel code blocks, and sketch high
 - **5-Tab Sidebar Navigator:**
   - **History:** Recently pushed headings from Emacs.
   - **Outline:** Full hierarchical heading tree of the active `.org` buffer with collapse/expand and sketch count badges (`🎨`).
-  - **Agenda:** Scheduled/deadline items and active `TODO`/`NEXT` tasks across `org-agenda-files`.
-  - **Search:** Instant full-text, title, and tag search across your Org directory and `org-roam`.
+  - **Agenda:** Today's entries from Emacs' own day agenda (overdue, scheduled, deadline warnings, timed items first).
+  - **Search:** Full-text, title, tag and OCR search across Org buffers and `org-agenda-files` (2+ characters, capped at `org-writenotes-search-max-results`).
+- **Focus Mode:** The sidebar shrinks to an icon rail; one-finger swipes left/right (or `Alt+←/→`) walk back and forward through the headings you visited.
+- **Command Palette & Keyboard Shortcuts:** `Ctrl+K` fuzzy-searches actions and headings. `C-c w f` / `C-c w q` / `C-c w w` mirror the Emacs prefix; `Ctrl+\` focus mode, `Ctrl+1…5` sidebar tabs, `Ctrl+N` new heading, `Ctrl+T` cycle TODO, `Ctrl+Shift+C` clock in/out.
+- **E-Ink Profile (Onyx Boox):** No animations, high-contrast chrome, shape-coded connection status (filled = connected, ring = offline, ring + dot = connecting, ring + ✕ = error) and named pen-color swatches.
   - **Gallery:** Visual thumbnail grid of all `.svgz` sketches with one-tap jump to the parent heading.
 - **Rich Interactive Org AST Blocks:**
   - **Header Card & Metadata:** Cycle `TODO`/`NEXT`/`DONE` states, set priorities (`[#A]`–`[#C]`), edit `:tags:`, pick `SCHEDULED` and `DEADLINE` dates via Material 3 DatePickers, and edit `:PROPERTIES:` drawers.
@@ -65,6 +71,7 @@ Write structured notes, manage tasks, execute Babel code blocks, and sketch high
 - **Data Safety & Conflict Protection:**
   - Atomic `.svgz` disk writes (`temp + rename`) and automatic rolling snapshot history (`writenotes/.history/`) with one-command revert (`M-x org-writenotes-revert-sketch-at-point`).
   - Optimistic concurrency via SHA-1 `etag` / `baseEtag` verification—conflicting edits are safely preserved as `*.conflict-<timestamp>.svgz`.
+  - **Conflict Resolution Screen:** Review both versions side by side, overlaid, or flipping between them, then keep the Emacs copy, keep the tablet copy, or merge every stroke. The replaced copy is kept in `.history/`.
 - **Dark Mode & Theme Synchronization:**
   - Emacs broadcasts its active theme palette (`isDark`, background, foreground, accent) to the tablet.
   - Adaptive inline `.svgz` rendering in Emacs (`org-writenotes-inline-theme`) automatically adjusts paper and ink contrast in dark mode without altering the saved `.svgz` file on disk.

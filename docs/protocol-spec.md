@@ -106,7 +106,9 @@ An Org node's body is decomposed into an ordered list of blocks so that native U
   - Params: `{ "clientName": "Pixel Tablet", "version": "1.0.0", "token": "..." }`
   - Result: `{ "emacsVersion": "30.1", "orgVersion": "9.7", "imageDir": "./writenotes", "activeNodeId": "..." }`
 - **`node.list`**
-  - Params: `{ "filter": "todo_and_agenda" | "current_buffer" | "search", "query": "" }`
+  - Params: `{ "filter": "pushed_history" | "buffer_outline" | "agenda" | "search", "query": "", "date": "YYYY-MM-DD" }`
+  - `agenda` returns the entries of Emacs' own day agenda (`org-agenda-get-day-entries` over `org-agenda-files`) for `date` (default today): overdue SCHEDULED items and DEADLINE warnings included, timed entries first. Each summary carries an `agendaLabel` such as `"14:30"`, `"Scheduled"`, `"Sched.3x"`, `"In 2 d."`.
+  - `search` needs a query of 2+ characters, matches each heading once, and returns at most `org-writenotes-search-max-results` (default 100) nodes.
   - Result: `{ "nodes": [ OrgNodeSummary, ... ] }`
 - **`node.get`**
   - Params: `{ "nodeId": "..." }`
@@ -151,6 +153,14 @@ An Org node's body is decomposed into an ordered list of blocks so that native U
     }
     ```
   - Result: `{ "savedPath": "/home/user/org/writenotes/design-system-arch-20261102-153000.svgz", "bytesWritten": 6412 }`
+
+- **`ink.conflictInfo`** (capability `ink.resolveConflict`)
+  - Params: `{ "nodeId": "...", "fileName": "...", "conflictFile": "optional; default newest" }`
+  - Result: `{ "fileName", "conflictFile", "conflictCount", "emacsSvgzBase64", "tabletSvgzBase64", "etag" }`
+- **`ink.resolveConflict`**
+  - Params: `{ "nodeId": "...", "fileName": "...", "conflictFile": "...", "choice": "emacs" | "tablet" | "merged", "svgzBase64": "<merged copy, for merged>" }`
+  - The previous file is snapshotted to `.history/` and the conflict copy moved there (never deleted).
+  - Result: `{ "svgzBase64": "<final file>", "etag": "...", "remainingConflicts": 0 }`
 
 ### 3.4 Server Push Notifications (Emacs → Tablet)
 - **`emacs.focusNode`** *(Sent when user runs `M-x org-writenotes-push-node` or when `org-writenotes-follow-mode` moves to a new heading)*

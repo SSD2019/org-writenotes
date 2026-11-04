@@ -32,6 +32,9 @@
 (require 'json)
 (require 'url-util)
 
+(declare-function calendar-current-date "calendar" (&optional offset))
+(declare-function org-agenda-get-day-entries "org-agenda" (file date &rest args))
+
 (defgroup org-writenotes nil
   "Handwritten stylus notes companion app for Org-mode."
   :group 'org
@@ -1265,66 +1268,121 @@ ORG-FILE is the file used to resolve sketch links."
           (cl-pushnew (find-file-noselect f) bufs))))
     bufs))
 
-(defun org-writenotes--collect-agenda-nodes (&optional query)
-  "Collect nodes with active TODO keywords or SCHEDULED/DEADLINE dates.\nOptional QUERY filters the results."
-  (let ((results nil)
-        (q (and query (not (string-empty-p query)) (downcase query))))
-    (dolist (buf (org-writenotes--candidate-org-buffers))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (save-excursion
-            (save-restriction
-              (widen)
-              (goto-char (point-min))
-              (while (re-search-forward org-heading-regexp nil t)
-                (save-excursion
-                  (goto-char (match-beginning 0))
-                  (let* ((summary (org-writenotes--node-summary-at-point))
-                         (todo (plist-get summary :todoKeyword))
-                         (sched (plist-get summary :scheduled))
-                         (deadl (plist-get summary :deadline))
-                         (title (or (plist-get summary :title) "")))
-                    (when (and (or (and (stringp todo) (not (member todo '("DONE" "CANCELLED"))))
-                                   (stringp sched)
-                                   (stringp deadl))
-                               (or (not q)
-                                   (string-match-p (regexp-quote q) (downcase title))))
-                      (push summary results))))))))))
+;; Max nodes returned by `search'; a 2-letter query can match every heading.
+(defcustom org-writenotes-search-max-results 100
+  "Maximum number of nodes returned to the tablet for a search query."
+  :type 'integer
+  :group 'org-writenotes)
+
+(defun org-writenotes--agenda-date (date-str)
+  "Parse DATE-STR (YYYY-MM-DD) into a calendar date (MONTH DAY YEAR), default today."
+  (if (and (stringp date-str)
+           (string-match "\\`\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)\\'" date-str))
+      (list (string-to-number (match-string 2 date-str))
+            (string-to-number (match-string 3 date-str))
+            (string-to-number (match-string 1 date-str)))
+    (calendar-current-date)))
+
+(defun org-writenotes--collect-agenda-nodes (&optional query date-str)
+  "Collect the nodes Emacs' own day agenda shows for DATE-STR (default today).
+Uses `org-agenda-get-day-entries' over `org-agenda-files', so overdue
+SCHEDULED items, DEADLINE warnings and the user's skip settings apply.
+Optional QUERY filters the results by title."
+  (require 'org-agenda)
+  (let* ((date (org-writenotes--agenda-date date-str))
+         (q (and query (not (string-empty-p query)) (downcase query)))
+         (entries nil)
+         (seen (make-hash-table :test #'equal))
+         (results nil))
+    (dolist (file (ignore-errors (org-agenda-files nil 'ifmode)))
+      (when (file-exists-p file)
+        (setq entries
+              (nconc entries
+                     (ignore-errors
+                       (apply #'org-agenda-get-day-entries file date
+                              (or org-agenda-entry-types
+                                  '(:deadline :scheduled :timestamp :sexp))))))))
+    ;; Timed entries first (by time of day), then by agenda priority (highest first).
+    (setq entries
+          (sort entries
+                (lambda (a b)
+                  (let ((ta (or (get-text-property 0 'time-of-day a) 9999))
+                        (tb (or (get-text-property 0 'time-of-day b) 9999)))
+                    (if (/= ta tb)
+                        (< ta tb)
+                      (> (or (get-text-property 0 'priority a) 0)
+                         (or (get-text-property 0 'priority b) 0)))))))
+    (dolist (entry entries)
+      (let ((marker (or (get-text-property 0 'org-hd-marker entry)
+                        (get-text-property 0 'org-marker entry))))
+        (when (and (markerp marker) (buffer-live-p (marker-buffer marker)))
+          (with-current-buffer (marker-buffer marker)
+            (save-excursion
+              (save-restriction
+                (widen)
+                (goto-char marker)
+                (when (ignore-errors (org-back-to-heading t) t)
+                  (let ((key (cons (current-buffer) (point))))
+                    (unless (gethash key seen)
+                      (puthash key t seen)
+                      (let* ((summary (org-writenotes--node-summary-at-point))
+                             (extra (string-trim (or (get-text-property 0 'extra entry) "")))
+                             (tod (get-text-property 0 'time-of-day entry))
+                             (label (string-trim
+                                     (concat (if tod (format "%02d:%02d " (/ tod 100) (% tod 100)) "")
+                                             (string-remove-suffix ":" extra)))))
+                        (when (or (not q)
+                                  (string-match-p (regexp-quote q)
+                                                  (downcase (or (plist-get summary :title) ""))))
+                          (push (append summary
+                                        (list :agendaLabel (if (string-empty-p label) :null label)))
+                                results))))))))))))
     (vconcat (nreverse results))))
 
 (defun org-writenotes--collect-search-nodes (query)
-  "Search headings, tags, body text, and `:WRITENOTES_OCR:' drawers across Org buffers for QUERY."
+  "Search headings, tags, body text, and `:WRITENOTES_OCR:' drawers across Org buffers for QUERY.
+Scans for QUERY directly with `search-forward' (fast) instead of extracting every
+heading's body, and stops at `org-writenotes-search-max-results' nodes."
   (let ((results nil)
+        (count 0)
         (q (string-trim (or query ""))))
-    (dolist (buf (org-writenotes--candidate-org-buffers))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (save-excursion
-            (save-restriction
-              (widen)
-              (goto-char (point-min))
-              (while (re-search-forward org-heading-regexp nil t)
-                (save-excursion
-                  (goto-char (match-beginning 0))
-                  (let* ((beg (point))
-                         (sub-end (save-excursion (org-end-of-subtree t t) (point)))
-                         (body-end (org-writenotes--body-end-pos beg sub-end))
-                         (body-txt (buffer-substring-no-properties beg body-end))
-                         (case-fold-search t))
-                    (when (or (string-empty-p q)
-                              (string-match-p (regexp-quote q) body-txt))
-                      (push (org-writenotes--node-summary-at-point) results))))))))))
+    (unless (< (length q) 2)
+      (catch 'done
+        (dolist (buf (org-writenotes--candidate-org-buffers))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (save-excursion
+                (save-restriction
+                  (widen)
+                  (goto-char (point-min))
+                  (let ((case-fold-search t))
+                    (while (search-forward q nil t)
+                      (let ((match (match-beginning 0)))
+                        (goto-char match)
+                        (if (not (ignore-errors (org-back-to-heading t) t))
+                            ;; Match before the first heading: skip past it.
+                            (goto-char (min (point-max) (1+ match)))
+                          (push (org-writenotes--node-summary-at-point) results)
+                          (setq count (1+ count))
+                          (when (>= count org-writenotes-search-max-results)
+                            (throw 'done nil))
+                          ;; Continue after this heading's direct body.
+                          (goto-char (org-writenotes--body-end-pos
+                                      (point)
+                                      (save-excursion (org-end-of-subtree t t) (point))))
+                          (when (and (<= (point) match) (< (point) (point-max)))
+                            (goto-char (1+ match))))))))))))))
     (vconcat (nreverse results))))
 
-(defun org-writenotes--collect-node-summaries (&optional filter query)
+(defun org-writenotes--collect-node-summaries (&optional filter query date)
   "Return a vector of node summaries for FILTER.
 FILTER is one of `pushed_history', `buffer_outline', `agenda' or `search'.
-QUERY narrows search results."
+QUERY narrows search results.  DATE (YYYY-MM-DD) picks the agenda day."
   (cond
    ((equal filter "buffer_outline")
     (org-writenotes--collect-buffer-outline))
    ((equal filter "agenda")
-    (org-writenotes--collect-agenda-nodes query))
+    (org-writenotes--collect-agenda-nodes query date))
    ((equal filter "search")
     (org-writenotes--collect-search-nodes query))
    (t
@@ -2390,7 +2448,8 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
                   ("node.list"
                    `(:nodes ,(org-writenotes--collect-node-summaries
                               (alist-get 'filter params)
-                              (alist-get 'query params))))
+                              (alist-get 'query params)
+                              (alist-get 'date params))))
                   ("node.get"
                    (let* ((nid (or (alist-get 'nodeId params)
                                    org-writenotes--active-node-id))

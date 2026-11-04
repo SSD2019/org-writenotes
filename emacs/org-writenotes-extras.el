@@ -28,7 +28,8 @@
   "Wire protocol version spoken by this Emacs server.")
 
 (defconst org-writenotes--capabilities
-  ["ink.commit.etag" "ink.commit.dedupe" "ink.history" "ink.revert" "auth.ratelimit"]
+  ["ink.commit.etag" "ink.commit.dedupe" "ink.history" "ink.revert" "ink.resolveConflict"
+    "auth.ratelimit"]
   "Capabilities advertised to clients in `session.hello'.")
 
 (defcustom org-writenotes-max-auth-failures 5
@@ -139,6 +140,70 @@
     `(:svgzBase64 ,(base64-encode-string bytes t)
       :etag ,(secure-hash 'sha1 bytes))))
 
+;;; A3: conflict resolution from the tablet -------------------------------------
+
+(defun org-writenotes--conflict-copies (abs)
+  "Return the `*.conflict-*.svgz' copies of sketch ABS, newest first."
+  (let ((dir (file-name-directory abs))
+        (base (file-name-nondirectory (file-name-sans-extension abs))))
+    (when (file-directory-p dir)
+      (sort (directory-files
+             dir t (concat "\\`" (regexp-quote base) "\\.conflict-[0-9T]+\\.svgz\\'"))
+            #'string>))))
+
+(defun org-writenotes--conflict-copy-path (abs params)
+  "Return the conflict copy of ABS named by `conflictFile' in PARAMS (default newest)."
+  (let* ((copies (org-writenotes--conflict-copies abs))
+         (wanted (alist-get 'conflictFile params))
+         (hit (if wanted
+                  (cl-find (file-name-nondirectory wanted) copies
+                           :key #'file-name-nondirectory :test #'equal)
+                (car copies))))
+    (or hit (error "No conflict copy for %s" (file-name-nondirectory abs)))))
+
+(defun org-writenotes--handle-ink-conflict-info (params)
+  "Return both versions of the conflicted sketch in PARAMS for side-by-side review."
+  (let* ((abs (org-writenotes--resolve-sketch-path params))
+         (copy (org-writenotes--conflict-copy-path abs params)))
+    (unless (file-exists-p abs) (error "Sketch not found: %s" (file-name-nondirectory abs)))
+    `(:fileName ,(file-name-nondirectory abs)
+      :conflictFile ,(file-name-nondirectory copy)
+      :conflictCount ,(length (org-writenotes--conflict-copies abs))
+      :emacsSvgzBase64 ,(base64-encode-string (org-writenotes--read-raw-bytes abs) t)
+      :tabletSvgzBase64 ,(base64-encode-string (org-writenotes--read-raw-bytes copy) t)
+      :etag ,(org-writenotes--file-etag abs))))
+
+(defun org-writenotes--retire-conflict-copy (abs copy)
+  "Move conflict COPY of ABS into its `.history/' directory instead of deleting it."
+  (let ((dir (org-writenotes--history-dir abs))
+        (file-name-handler-alist nil))
+    (make-directory dir t)
+    (rename-file copy (expand-file-name (file-name-nondirectory copy) dir) t)))
+
+(defun org-writenotes--handle-ink-resolve-conflict (params)
+  "Resolve a sketch conflict: `choice' is \"emacs\", \"tablet\" or \"merged\".
+\"merged\" writes the `svgzBase64' in PARAMS (the tablet's stroke union).  The
+previous file is snapshotted and the conflict copy moved into `.history/'."
+  (let* ((abs (org-writenotes--resolve-sketch-path params))
+         (copy (org-writenotes--conflict-copy-path abs params))
+         (choice (alist-get 'choice params))
+         (bytes (pcase choice
+                  ("emacs" nil)
+                  ("tablet" (org-writenotes--read-raw-bytes copy))
+                  ("merged" (base64-decode-string
+                             (or (alist-get 'svgzBase64 params) (error "Missing svgzBase64"))))
+                  (_ (error "Unknown choice: %s" choice)))))
+    (when bytes
+      (org-writenotes--snapshot-sketch abs t)
+      (remhash abs org-writenotes--live-svg-cache)
+      (org-writenotes--write-raw-bytes abs bytes)
+      (org-writenotes--refresh-inline-image abs))
+    (org-writenotes--retire-conflict-copy abs copy)
+    (let ((final (org-writenotes--read-raw-bytes abs)))
+      `(:svgzBase64 ,(base64-encode-string final t)
+        :etag ,(secure-hash 'sha1 final)
+        :remainingConflicts ,(length (org-writenotes--conflict-copies abs))))))
+
 (defun org-writenotes--svgz-link-at-point ()
   "Return absolute path of the `.svgz' file link at point, or nil."
   (let ((ctx (org-element-context)))
@@ -200,6 +265,8 @@ PARAMS is the RPC parameter alist."
 (defconst org-writenotes--extra-rpc-methods
   `(("ink.history" . org-writenotes--handle-ink-history)
     ("ink.revert"  . org-writenotes--handle-ink-revert)
+    ("ink.conflictInfo" . org-writenotes--handle-ink-conflict-info)
+    ("ink.resolveConflict" . org-writenotes--handle-ink-resolve-conflict)
     ("node.flagFlashcard" . org-writenotes--handle-flag-flashcard)
     ("presence.list" . org-writenotes--handle-presence-list))
   "Additional JSON-RPC methods handled by this module.")

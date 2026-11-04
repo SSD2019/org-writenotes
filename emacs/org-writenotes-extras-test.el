@@ -60,6 +60,44 @@
           (should (equal (org-writenotes--read-raw-bytes f) "new"))
           (should (= (length (org-writenotes--list-snapshots f)) 1)))))))
 
+(ert-deftest org-writenotes-extras-resolve-conflict ()
+  "Conflict info returns both copies; each choice writes the right bytes and retires the copy."
+  (org-writenotes-test--with-dir d
+    (let ((f (expand-file-name "s.svgz" d))
+          (org-writenotes-sketch-history-min-interval 0))
+      (cl-letf (((symbol-function 'org-writenotes--resolve-sketch-path) (lambda (_) f))
+                ((symbol-function 'org-writenotes--resolve-image-dir) (lambda (_) d))
+                ((symbol-function 'org-writenotes--refresh-inline-image) #'ignore)
+                ((symbol-function 'org-writenotes--locate-node) (lambda (_) nil)))
+        (cl-flet ((make-conflict (tablet)
+                    (org-writenotes--write-raw-bytes f "disk")
+                    (org-writenotes--handle-ink-commit
+                     `((nodeId . "n") (fileName . "s.svgz") (baseEtag . "stale")
+                       (svgzBase64 . ,(base64-encode-string tablet))))
+                    (sleep-for 1.1))
+                  (resolve (choice &optional b64)
+                    (org-writenotes--handle-ink-resolve-conflict
+                     `((nodeId . "n") (fileName . "s.svgz") (choice . ,choice)
+                       ,@(when b64 `((svgzBase64 . ,b64)))))))
+          (make-conflict "tablet")
+          (let ((info (org-writenotes--handle-ink-conflict-info '((nodeId . "n") (fileName . "s.svgz")))))
+            (should (equal (base64-decode-string (plist-get info :emacsSvgzBase64)) "disk"))
+            (should (equal (base64-decode-string (plist-get info :tabletSvgzBase64)) "tablet")))
+          ;; Keep Emacs: disk untouched, conflict copy moved into .history/
+          (should (= 0 (plist-get (resolve "emacs") :remainingConflicts)))
+          (should (equal (org-writenotes--read-raw-bytes f) "disk"))
+          (should (directory-files (org-writenotes--history-dir f) nil "conflict"))
+          ;; Keep tablet
+          (make-conflict "tablet2")
+          (resolve "tablet")
+          (should (equal (org-writenotes--read-raw-bytes f) "tablet2"))
+          ;; Merged bytes from the tablet
+          (make-conflict "tablet3")
+          (let ((res (resolve "merged" (base64-encode-string "union"))))
+            (should (equal (org-writenotes--read-raw-bytes f) "union"))
+            (should (equal (plist-get res :etag) (secure-hash 'sha1 "union"))))
+          (should-error (resolve "emacs")))))))
+
 (ert-deftest org-writenotes-extras-repair-links ()
   (org-writenotes-test--with-dir d
     (make-directory (expand-file-name "writenotes/sub" d) t)
