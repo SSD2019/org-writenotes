@@ -51,6 +51,13 @@ Use \"127.0.0.1\" for ADB USB debugging, or \"0.0.0.0\" for LAN/Tailscale."
   :type 'string
   :group 'org-writenotes)
 
+(defcustom org-writenotes-require-session-token nil
+  "Whether non-loopback clients must present the session token.
+When nil, LAN / Tailscale clients may connect without a token. The token is
+still generated and shown in the pairing QR code."
+  :type 'boolean
+  :group 'org-writenotes)
+
 (defcustom org-writenotes-image-dir "./writenotes"
   "Common directory for storing `.svgz' handwritten ink files.
 Can be a path relative to the `.org' file (e.g., \"./writenotes\") or an
@@ -2776,7 +2783,8 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
                   ("session.hello"
                    (let ((token (alist-get 'token params)))
                      ;; Validate token on non-loopback bindings
-                     (when (and (not (member (or org-writenotes--bound-host org-writenotes-host)
+                     (when (and org-writenotes-require-session-token
+                                (not (member (or org-writenotes--bound-host org-writenotes-host)
                                             '("127.0.0.1" "localhost")))
                                 org-writenotes--session-token
                                 (not (equal token org-writenotes--session-token)))
