@@ -212,5 +212,246 @@
         (when buf (kill-buffer buf)))
       (delete-file tmp))))
 
+;; Idle-time OCR: recognition must wait for Emacs idleness and a quiet sketch.
+(defmacro org-writenotes-test--with-ocr-sketch (vars org-text &rest body)
+  "Run BODY with VARS = (ORG-FILE NODE-ID SVGZ) bound to a temp sketch fixture.
+ORG-TEXT is the content of the Org file; the OCR helper counts as installed."
+  (declare (indent 2))
+  (let ((dir (make-symbol "dir")))
+    `(let* ((,dir (make-temp-file "org-wn-ocr-" t))
+            (,(nth 0 vars) (expand-file-name "notes.org" ,dir))
+            (,(nth 1 vars) (format "file:%s::line:1" ,(nth 0 vars)))
+            (,(nth 2 vars) (expand-file-name "writenotes/sketch.svgz" ,dir))
+            (org-writenotes-ocr-enabled t)
+            (org-writenotes-ocr-idle-seconds 5))
+       (make-directory (file-name-directory ,(nth 2 vars)) t)
+       (with-temp-file ,(nth 2 vars)
+         (set-buffer-multibyte nil)
+         (insert "svgz-bytes-1"))
+       (with-temp-file ,(nth 0 vars) (insert ,org-text))
+       (unwind-protect
+           (cl-letf (((symbol-function 'org-writenotes--ocr-available-p) (lambda () t)))
+             ,@body)
+         (org-writenotes--ocr-shutdown)
+         (clrhash org-writenotes--ocr-done)
+         (let ((buf (find-buffer-visiting ,(nth 0 vars))))
+           (when buf
+             (with-current-buffer buf (set-buffer-modified-p nil))
+             (kill-buffer buf)))
+         (delete-directory ,dir t)))))
+
+(defun org-writenotes-test--file-string (file)
+  "Return the contents of FILE as a string."
+  (with-temp-buffer (insert-file-contents file) (buffer-string)))
+
+(defun org-writenotes-test--backdate-ocr (path)
+  "Make the queued commit for PATH old enough to count as quiet."
+  (let ((entry (copy-sequence (gethash path org-writenotes--ocr-pending))))
+    (puthash path (plist-put entry :time (- (float-time) 60)) org-writenotes--ocr-pending)))
+
+(ert-deftest org-writenotes-test-ocr-needs-idle-emacs-and-quiet-sketch ()
+  "OCR is due only when Emacs is idle and the sketch has not changed recently."
+  (let ((org-writenotes-ocr-idle-seconds 5)
+        (old (- (float-time) 10))
+        (fresh (float-time)))
+    (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () 10)))
+      (should (org-writenotes--ocr-quiet-p old))
+      (should-not (org-writenotes--ocr-quiet-p fresh)))
+    (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () 2)))
+      (should-not (org-writenotes--ocr-quiet-p old)))
+    (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () nil)))
+      (should-not (org-writenotes--ocr-quiet-p old)))))
+
+(ert-deftest org-writenotes-test-ocr-idle-job-writes-drawer-once ()
+  "A quiet queued sketch is recognised once; unchanged bytes are not re-run."
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n"
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () 60))
+                ((symbol-function 'org-writenotes--ocr-run-helper)
+                 (lambda (_bytes callback)
+                   (cl-incf calls)
+                   (funcall callback "Architecture Overview"))))
+        (org-writenotes--ocr-enqueue svgz node-id "sketch.svgz")
+        ;; Just committed: Emacs is idle but the sketch is not quiet yet.
+        (org-writenotes--ocr-tick)
+        (should (= calls 0))
+        (should (= 1 (hash-table-count org-writenotes--ocr-pending)))
+        (org-writenotes-test--backdate-ocr svgz)
+        (org-writenotes--ocr-tick)
+        (should (= calls 1))
+        (should (= 0 (hash-table-count org-writenotes--ocr-pending)))
+        (should (string-match-p ":WRITENOTES_OCR:\nArchitecture Overview\n:END:"
+                                (org-writenotes-test--file-string org-file)))
+        ;; Same bytes committed again: already recognised, helper stays idle.
+        (org-writenotes--ocr-enqueue svgz node-id "sketch.svgz")
+        (org-writenotes-test--backdate-ocr svgz)
+        (org-writenotes--ocr-tick)
+        (should (= calls 1))))))
+
+(ert-deftest org-writenotes-test-ocr-waits-while-emacs-is-busy ()
+  "Nothing runs while Emacs is in use, however old the queued commit is."
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n"
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () 1))
+                ((symbol-function 'org-writenotes--ocr-run-helper)
+                 (lambda (_bytes callback) (cl-incf calls) (funcall callback "x"))))
+        (org-writenotes--ocr-enqueue svgz node-id "sketch.svgz")
+        (org-writenotes-test--backdate-ocr svgz)
+        (org-writenotes--ocr-tick)
+        (should (= calls 0))
+        (should (= 1 (hash-table-count org-writenotes--ocr-pending)))
+        ;; `org-writenotes-ocr-run-now' overrides the idle requirement.
+        (org-writenotes-ocr-run-now)
+        (should (= calls 1))
+        (should (= 0 (hash-table-count org-writenotes--ocr-pending)))))))
+
+(ert-deftest org-writenotes-test-ocr-failed-helper-leaves-drawer-and-queue-empty ()
+  "A failing helper must not clobber the drawer or retry in a loop."
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n:WRITENOTES_OCR:\nOLD\n:END:\n"
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () 60))
+                ((symbol-function 'org-writenotes--ocr-run-helper)
+                 (lambda (_bytes callback) (cl-incf calls) (funcall callback nil))))
+        (org-writenotes--ocr-enqueue svgz node-id "sketch.svgz")
+        (org-writenotes-test--backdate-ocr svgz)
+        (org-writenotes--ocr-tick)
+        (should (= calls 1))
+        (should (= 0 (hash-table-count org-writenotes--ocr-pending)))
+        (should (string-match-p "OLD" (org-writenotes-test--file-string org-file)))))))
+
+(ert-deftest org-writenotes-test-ocr-replaces-existing-drawer-instead-of-stacking ()
+  "Fresh OCR text replaces the old drawer; drawers must never pile up."
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n:WRITENOTES_OCR:\nOLD TEXT\n:END:\nBody text\n"
+    (org-writenotes--update-ocr-drawer node-id "sketch.svgz" "NEW TEXT" t)
+    (org-writenotes--update-ocr-drawer node-id "sketch.svgz" "NEWER TEXT" t)
+    (let ((content (org-writenotes-test--file-string org-file)))
+      (should (string-match-p "NEWER TEXT" content))
+      (should-not (string-match-p "OLD TEXT\\|NEW TEXT" content))
+      (should (= 1 (with-temp-buffer
+                     (insert content)
+                     (goto-char (point-min))
+                     (let ((n 0))
+                       (while (search-forward ":WRITENOTES_OCR:" nil t) (cl-incf n))
+                       n))))
+      (should (string-match-p "Body text" content)))))
+
+(ert-deftest org-writenotes-test-ocr-off-by-default-and-drops-queue ()
+  "OCR is disabled by default; switching it off empties the queue without running."
+  (should-not (default-value 'org-writenotes-ocr-enabled))
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n"
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'org-writenotes--idle-seconds) (lambda () 60))
+                ((symbol-function 'org-writenotes--ocr-run-helper)
+                 (lambda (_bytes callback) (cl-incf calls) (funcall callback "x"))))
+        (org-writenotes--ocr-enqueue svgz node-id "sketch.svgz")
+        (org-writenotes-test--backdate-ocr svgz)
+        (should (= 1 (hash-table-count org-writenotes--ocr-pending)))
+        (cl-letf (((symbol-function 'org-writenotes--ocr-available-p) (lambda () nil)))
+          (org-writenotes--ocr-tick)
+          (org-writenotes--ocr-enqueue svgz node-id "sketch.svgz"))
+        (should (= calls 0))
+        (should (= 0 (hash-table-count org-writenotes--ocr-pending)))))))
+
+(ert-deftest org-writenotes-test-ocr-run-now-explains-why-it-cannot-run ()
+  "`org-writenotes-ocr-run-now' says whether OCR is off or the helper is missing."
+  (let ((org-writenotes-ocr-enabled nil))
+    (should (string-match-p "OCR is off"
+                            (cadr (should-error (org-writenotes-ocr-run-now) :type 'user-error)))))
+  (let ((org-writenotes-ocr-enabled t)
+        (org-writenotes-ocr-python "/nonexistent/python"))
+    (should (string-match-p "Python not found"
+                            (cadr (should-error (org-writenotes-ocr-run-now) :type 'user-error)))))
+  (let ((org-writenotes-ocr-enabled t)
+        (org-writenotes-ocr-python "/bin/sh")
+        (org-writenotes-ocr-script "/nonexistent/recognize.py"))
+    (should (string-match-p "script not found"
+                            (cadr (should-error (org-writenotes-ocr-run-now) :type 'user-error))))))
+
+(ert-deftest org-writenotes-test-ocr-parse-output ()
+  "The helper's JSON line is turned into newline-joined text."
+  (should (equal (org-writenotes--ocr-parse-output
+                  "{\"lines\": [\"first\", \"second\"], \"device\": \"cpu\"}\n")
+                 "first\nsecond"))
+  (should (equal (org-writenotes--ocr-parse-output "{\"lines\": []}") ""))
+  (should-not (org-writenotes--ocr-parse-output "not json")))
+
+(ert-deftest org-writenotes-test-ink-commit-keeps-drawer-and-queues-ocr ()
+  "With the OCR helper present, a commit queues the sketch and keeps the old drawer."
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n:WRITENOTES_OCR:\nOLD TEXT\n:END:\n"
+    (org-writenotes--handle-ink-commit
+     `((nodeId . ,node-id) (fileName . "sketch.svgz")
+       (svgzBase64 . ,(base64-encode-string "svgz-bytes-2" t))))
+    (should (string-match-p "OLD TEXT" (org-writenotes-test--file-string org-file)))
+    (should (gethash svgz org-writenotes--ocr-pending))))
+
+(ert-deftest org-writenotes-test-ink-commit-without-helper-drops-stale-drawer ()
+  "Without the OCR helper, the pre-existing behaviour (drop stale drawer) is kept."
+  (org-writenotes-test--with-ocr-sketch (org-file node-id svgz)
+      "* Sketch node\n[[file:./writenotes/sketch.svgz]]\n:WRITENOTES_OCR:\nOLD TEXT\n:END:\n"
+    (cl-letf (((symbol-function 'org-writenotes--ocr-available-p) (lambda () nil)))
+      (org-writenotes--handle-ink-commit
+       `((nodeId . ,node-id) (fileName . "sketch.svgz")
+         (svgzBase64 . ,(base64-encode-string "svgz-bytes-2" t)))))
+    (should-not (string-match-p "OLD TEXT" (org-writenotes-test--file-string org-file)))
+    (should-not (gethash svgz org-writenotes--ocr-pending))))
+
+(ert-deftest org-writenotes-test-compensate-nonscaling-ruling-strokes ()
+  "Ruling stroke widths are divided by the display scale; pen strokes are untouched."
+  (let* ((svg (concat "<svg xmlns=\"http://www.w3.org/2000/svg\">"
+                      "<svg class=\"write-page\" x=\"10\" y=\"0\" width=\"1200px\" height=\"400px\">"
+                      "<g class=\"write-content\">"
+                      "<g class=\"ruleline write-std-ruling\" stroke-width=\"1\" "
+                      "vector-effect=\"non-scaling-stroke\">"
+                      "<path stroke-width=\"2.2\" d=\"M0 40\"/>"
+                      "<g><path stroke-width=\"3\" d=\"M0 1\"/></g>"
+                      "<path d=\"M0 80\"/></g>"
+                      "<path class=\"write-round-pen\" fill=\"#000\" stroke-width=\"2.6\" d=\"M1 1\"/>"
+                      "</g></svg></svg>"))
+         (out (org-writenotes--compensate-nonscaling-strokes svg 0.5)))
+    (should (string-match-p "class=\"ruleline write-std-ruling\" stroke-width=\"2\"" out))
+    (should (string-match-p "stroke-width=\"4.4\" d=\"M0 40\"" out))
+    (should (string-match-p "stroke-width=\"6\" d=\"M0 1\"" out))
+    (should (string-match-p "stroke-width=\"2.6\" d=\"M1 1\"" out))
+    (should (equal svg (org-writenotes--compensate-nonscaling-strokes svg 1.0)))
+    (should (equal svg (org-writenotes--compensate-nonscaling-strokes svg nil)))))
+
+(ert-deftest org-writenotes-test-compensate-strokes-fades-with-scale ()
+  "Shrunken template strokes get wider but keep the same total ink."
+  (let* ((plain "<g class=\"ruleline\" stroke=\"#475569\" stroke-width=\"1.1\"><path d=\"M0 0\"/></g>")
+         (with-opacity (concat "<g class=\"ruleline\" stroke-opacity=\"0.29\" stroke-width=\"1\">"
+                               "<path stroke-opacity=\"0.5\" d=\"M0 0\"/></g>")))
+    ;; Zoomed out: width / scale, opacity * scale; a group without opacity gets one.
+    (let ((out (org-writenotes--compensate-nonscaling-strokes plain 0.5)))
+      (should (string-match-p "stroke-width=\"2.2\"" out))
+      (should (string-match-p "stroke-opacity=\"0.5\">" out)))
+    (let ((out (org-writenotes--compensate-nonscaling-strokes with-opacity 0.5)))
+      (should (string-match-p "stroke-opacity=\"0.145\"" out))
+      (should (string-match-p "stroke-opacity=\"0.25\" d=" out))
+      (should (= 1 (with-temp-buffer
+                     (insert out) (goto-char (point-min))
+                     (let ((n 0)) (while (search-forward "<g " nil t) (cl-incf n)) n)))))
+    ;; Shown larger than native: width is held at one pixel but nothing fades.
+    (let ((out (org-writenotes--compensate-nonscaling-strokes with-opacity 2.0)))
+      (should (string-match-p "stroke-width=\"0.5\"" out))
+      (should (string-match-p "stroke-opacity=\"0.29\"" out))
+      (should-not (string-match-p "stroke-opacity=\"0.25\"" out)))))
+
+(ert-deftest org-writenotes-test-inline-scale-follows-image-props ()
+  "The scale Emacs applies is derived from the page width and image props."
+  (let ((svg (concat "<svg><svg class=\"write-page\" __comx=\"NaN\" x=\"10\" y=\"0\" "
+                     "width=\"1200px\" height=\"1360px\"></svg></svg>")))
+    (should (= 1220 (org-writenotes--svg-native-width svg)))
+    (should (< (abs (- 0.623 (org-writenotes--inline-scale 1220 '(:max-width 760)))) 0.001))
+    (should (= 1.0 (org-writenotes--inline-scale 1220 '(:max-width 2000))))
+    (should (= 0.5 (org-writenotes--inline-scale 1000 '(:width 500))))
+    (should (= 1.0 (org-writenotes--inline-scale 1000 nil)))
+    (should-not (org-writenotes--inline-scale nil '(:max-width 760)))))
+
 (provide 'org-writenotes-test)
 ;;; org-writenotes-test.el ends here

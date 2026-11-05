@@ -152,6 +152,55 @@ already exists under the sketch link."
   :type 'boolean
   :group 'org-writenotes)
 
+(defcustom org-writenotes-ocr-enabled nil
+  "If non-nil, recognise handwriting in sketches with the local TrOCR helper.
+Recognition never runs per commit.  Each commit queues the sketch, and it is
+processed only once Emacs has been idle, and the sketch left untouched, for
+`org-writenotes-ocr-idle-seconds'.  The result is written to the sketch's
+`:WRITENOTES_OCR:' drawer.  Nothing happens unless the helper is installed
+\(see `org-writenotes-ocr-python' and `org-writenotes-ocr-script')."
+  :type 'boolean
+  :group 'org-writenotes)
+
+(defcustom org-writenotes-ocr-idle-seconds 180
+  "Seconds of Emacs idle time and sketch inactivity before OCR runs."
+  :type 'number
+  :group 'org-writenotes)
+
+(defcustom org-writenotes-ocr-python
+  (expand-file-name "~/.cache/org-writenotes-ocr/venv/bin/python")
+  "Python interpreter, with torch, transformers and cairosvg, that runs the OCR helper."
+  :type 'file
+  :group 'org-writenotes)
+
+(defcustom org-writenotes-ocr-script
+  (expand-file-name "../ocr/recognize.py"
+                    (file-name-directory (or load-file-name buffer-file-name
+                                             default-directory)))
+  "Path to the `recognize.py' OCR helper script."
+  :type 'file
+  :group 'org-writenotes)
+
+(defcustom org-writenotes-ocr-device "auto"
+  "Device the OCR helper runs the model on."
+  :type '(choice (const "auto") (const "cuda") (const "cpu"))
+  :group 'org-writenotes)
+
+(defcustom org-writenotes-ocr-model nil
+  "TrOCR model the OCR helper loads, or nil for the helper's default.
+Pick one of the listed Hugging Face models, or choose Other and enter any
+TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first use."
+  :type '(choice
+          (const :tag "Default (microsoft/trocr-base-handwritten)" nil)
+          (const :tag "Base handwritten, English (~1.3 GB)" "microsoft/trocr-base-handwritten")
+          (const :tag "Large handwritten, English, more accurate but slower"
+                 "microsoft/trocr-large-handwritten")
+          (const :tag "Small handwritten, English, fastest" "microsoft/trocr-small-handwritten")
+          (const :tag "Swedish historical handwriting" "Riksarkivet/trocr-base-handwritten-hist-swe-2")
+          (const :tag "Korean (small)" "team-lucid/trocr-small-korean")
+          (string :tag "Other (Hugging Face id or local path)"))
+  :group 'org-writenotes)
+
 (defvar org-writenotes--last-theme-is-dark nil
   "Last known background mode of Emacs (t for dark, nil for light).")
 
@@ -476,6 +525,79 @@ repairs the file on disk to single-gzipped `.svgz'."
                 (decode-coding-string xml-bytes 'utf-8)
               xml-bytes)))))
 
+(defun org-writenotes--svg-native-width (svg-xml)
+  "Return the pixel width librsvg gives SVG-XML before scaling, or nil if unknown.
+That is the width of the `write-page' element plus the offset on both sides."
+  (when (string-match "<svg\\b[^>]*\\bclass=\"write-page\"[^>]*>" svg-xml)
+    (let* ((tag (match-string 0 svg-xml))
+           (w (and (string-match "[ \t\n]width=\"\\([0-9.]+\\)\\(?:px\\)?\"" tag)
+                   (string-to-number (match-string 1 tag))))
+           (x (if (string-match "[ \t\n]x=\"\\(-?[0-9.]+\\)" tag)
+                  (string-to-number (match-string 1 tag))
+                0)))
+      (and w (> w 0) (+ w (* 2 x))))))
+
+(defun org-writenotes--inline-scale (native-width props)
+  "Return the factor by which an image NATIVE-WIDTH px wide is shown given PROPS.
+PROPS is the `create-image' property list; return nil when it cannot be told."
+  (let ((width (plist-get props :width))
+        (max-width (plist-get props :max-width)))
+    (cond ((not (and (numberp native-width) (> native-width 0))) nil)
+          ((numberp width) (/ (float width) native-width))
+          ((numberp max-width) (min 1.0 (/ (float max-width) native-width)))
+          (t 1.0))))
+
+(defun org-writenotes--compensate-nonscaling-strokes (svg-xml scale)
+  "Return SVG-XML with its `ruleline' strokes adjusted for display SCALE.
+The tablet draws the page template (ruling, grid, dots) with
+`vector-effect: non-scaling-stroke', a fixed width in screen pixels, but
+librsvg ignores that and shrinks the lines with the image.  Stroke widths in
+those groups are divided by SCALE so they come out at the same pixel width as
+in the app.  When SCALE is below 1 their stroke opacity is multiplied by SCALE,
+so a line carries the same amount of ink as when librsvg thinned it: wider but
+not darker.  Pen strokes are filled outlines and scale correctly, so they are
+left alone."
+  (if (or (not (numberp scale)) (<= scale 0) (= scale 1.0))
+      svg-xml
+    (let ((factor (/ 1.0 scale))
+          (fade (min 1.0 scale)))
+      (with-temp-buffer
+        (insert svg-xml)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "<g\\b[^>]*\\bclass=\"[^\"]*\\bruleline\\b[^\"]*\"[^>]*>" nil t)
+          (let ((beg (match-beginning 0))
+                (tag-end (copy-marker (match-end 0)))
+                (depth 1))
+            ;; Find the matching </g>, allowing for nested groups.
+            (while (and (> depth 0) (re-search-forward "<g\\b\\|</g>" nil t))
+              (setq depth (if (string= (match-string 0) "</g>") (1- depth) (1+ depth))))
+            (let ((end (copy-marker (point))))
+              (save-restriction
+                (narrow-to-region beg end)
+                (goto-char (point-min))
+                (while (re-search-forward "stroke-width=\"\\([0-9.]+\\)\"" nil t)
+                  (replace-match
+                   (format "stroke-width=\"%.4g\""
+                           (* factor (string-to-number (match-string 1))))
+                   t t))
+                (when (< fade 1.0)
+                  (goto-char (point-min))
+                  (while (re-search-forward "stroke-opacity=\"\\([0-9.]+\\)\"" nil t)
+                    (replace-match
+                     (format "stroke-opacity=\"%.4g\""
+                             (* fade (string-to-number (match-string 1))))
+                     t t))
+                  ;; A group without its own opacity is fully opaque: fade it too.
+                  (goto-char (point-min))
+                  (unless (re-search-forward "stroke-opacity=" tag-end t)
+                    (goto-char (1- tag-end))
+                    (insert (format " stroke-opacity=\"%.4g\"" fade)))))
+              (goto-char end)
+              (set-marker end nil)
+              (set-marker tag-end nil))))
+        (buffer-string)))))
+
 (defun org-writenotes--create-image-svgz-advice (orig-fun file-or-data &optional type data-p &rest props)
   "Render `.svgz' files through `create-image' as native `svg' images.
 ORIG-FUN is the original function and FILE-OR-DATA, TYPE, DATA-P and
@@ -511,7 +633,12 @@ PROPS are the `create-image' arguments.  Colors adapt to the theme and
                  (save-match-data (string-match-p "<svg" svg-xml)))
             (let ((adapted-xml (or (ignore-errors (org-writenotes--adapt-svg-xml-for-theme svg-xml))
                                    svg-xml)))
-              (apply orig-fun adapted-xml 'svg t final-props))
+              (apply orig-fun
+                     (org-writenotes--compensate-nonscaling-strokes
+                      adapted-xml
+                      (org-writenotes--inline-scale
+                       (org-writenotes--svg-native-width svg-xml) final-props))
+                     'svg t final-props))
           (apply orig-fun file-or-data 'svg nil final-props)))
     (apply orig-fun file-or-data type data-p props)))
 
@@ -1703,11 +1830,11 @@ Supports `mode' (\"paragraph\" or \"checklist\"), `text', and optional `fileName
                   ;; Skip past any :WRITENOTES_OCR: drawer if present
                   (save-excursion
                     (forward-line 1)
-                    (when (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n[^z-a]*?^\\s-*:END:\\s-*$")
+                    (when (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n\\(?:.*\n\\)*?\\s-*:END:\\s-*$")
                       (goto-char (match-end 0))))
                   (when (save-excursion
                           (forward-line 1)
-                          (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n[^z-a]*?^\\s-*:END:\\s-*$"))
+                          (looking-at "^\\s-*:WRITENOTES_OCR:\\s-*\n\\(?:.*\n\\)*?\\s-*:END:\\s-*$"))
                     (forward-line 1)
                     (re-search-forward "^\\s-*:END:\\s-*$" body-end t))
                   (end-of-line)
@@ -2044,7 +2171,7 @@ If BARE-FILENAME is given, also clean up child headings matching OCR for that fi
   (save-excursion
     (skip-chars-forward " \t\n")
     (beginning-of-line)
-    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n[^z-a]*?^[ \t]*:END:[ \t]*\n?"))
+    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*\n?"))
       (while (looking-at drawer-re)
         (replace-match "" t t))))
   ;; 2. Remove any directly following OCR heading (e.g. "** OCR", "** OCR: ...", or "** Handwriting OCR")
@@ -2220,6 +2347,245 @@ PARAMS contains:
             (org-writenotes--refresh-inline-image abs-path)))))
     `(:ok t :strokeId ,(or stroke-id :null))))
 
+(defun org-writenotes--update-ocr-drawer (node-id bare-filename ocr-text &optional create)
+  "Rewrite the `:WRITENOTES_OCR:' drawer under BARE-FILENAME's link in NODE-ID.
+Any existing drawer is removed and, when OCR-TEXT is non-blank, replaced by a
+fresh one.  A drawer is created where none existed only when CREATE or
+`org-writenotes-auto-sync-ocr-drawer' is non-nil."
+  (when-let* ((loc (org-writenotes--locate-node node-id)))
+    (with-current-buffer (car loc)
+      (save-excursion
+        (goto-char (cdr loc))
+        (let* ((end (save-excursion (org-end-of-subtree t t) (point)))
+               (link-re (format "\\[\\[\\(?:file:\\|attachment:\\)[^]\n]*?%s\\(?:\\]\\[[^]\n]*\\)?\\]\\]"
+                                (regexp-quote bare-filename))))
+          (when (re-search-forward link-re end t)
+            (let* ((had-drawer nil)
+                   (trimmed-ocr (when (and ocr-text (stringp ocr-text))
+                                  (string-trim ocr-text)))
+                   (has-text (and trimmed-ocr (not (string-empty-p trimmed-ocr))))
+                   (may-create (or create org-writenotes-auto-sync-ocr-drawer)))
+              ;; Check and clean up any existing duplicate drawer(s) following the link
+              (save-excursion
+                (skip-chars-forward " \t\n")
+                (beginning-of-line)
+                (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*\n?"))
+                  (while (looking-at drawer-re)
+                    (setq had-drawer t)
+                    (replace-match "" t t))))
+              ;; Insert single clean drawer only if creation is allowed OR a drawer was already present
+              (when (and has-text (or may-create had-drawer))
+                (end-of-line)
+                (insert (format "\n:WRITENOTES_OCR:\n%s\n:END:\n" trimmed-ocr)))
+              (when (or had-drawer (and may-create has-text))
+                (save-buffer)))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Idle-time handwriting recognition (local TrOCR helper)
+;;; ---------------------------------------------------------------------------
+
+(defvar org-writenotes--ocr-pending (make-hash-table :test 'equal)
+  "Sketches waiting for recognition.
+Maps an absolute `.svgz' path to a plist (:node-id ID :file NAME :time T),
+where :time is `float-time' of the sketch's most recent commit.")
+
+(defvar org-writenotes--ocr-done (make-hash-table :test 'equal)
+  "Maps an absolute `.svgz' path to the SHA-1 of the bytes last recognised.")
+
+(defvar org-writenotes--ocr-process nil
+  "The running OCR helper process, or nil.")
+
+(defvar org-writenotes--ocr-timer nil
+  "Timer polling `org-writenotes--ocr-pending' while sketches are queued.")
+
+(defvar org-writenotes--ocr-flush nil
+  "Non-nil while `org-writenotes-ocr-run-now' drains the queue ignoring idleness.")
+
+(defun org-writenotes--ocr-available-p ()
+  "Return non-nil when OCR is enabled and the helper can be launched."
+  (and org-writenotes-ocr-enabled
+       (stringp org-writenotes-ocr-python)
+       (file-executable-p org-writenotes-ocr-python)
+       (stringp org-writenotes-ocr-script)
+       (file-readable-p org-writenotes-ocr-script)))
+
+(defun org-writenotes--idle-seconds ()
+  "Return how many seconds Emacs has been idle, or nil if it is not idle."
+  (let ((idle (current-idle-time)))
+    (and idle (float-time idle))))
+
+(defun org-writenotes--ocr-quiet-p (since)
+  "Return non-nil if Emacs and the sketch committed at SINCE have both been quiet.
+Quiet means untouched for `org-writenotes-ocr-idle-seconds'."
+  (let ((idle (org-writenotes--idle-seconds))
+        (wait org-writenotes-ocr-idle-seconds))
+    (and idle
+         (>= idle wait)
+         (>= (- (float-time) since) wait))))
+
+(defun org-writenotes--ocr-ensure-timer ()
+  "Start the queue-polling timer unless it is already running."
+  (unless (timerp org-writenotes--ocr-timer)
+    (let ((interval (max 1 (min 30 org-writenotes-ocr-idle-seconds))))
+      (setq org-writenotes--ocr-timer
+            (run-with-timer interval interval #'org-writenotes--ocr-tick)))))
+
+(defun org-writenotes--ocr-cancel-timer ()
+  "Stop the queue-polling timer."
+  (when (timerp org-writenotes--ocr-timer)
+    (cancel-timer org-writenotes--ocr-timer)
+    (setq org-writenotes--ocr-timer nil)))
+
+(defun org-writenotes--ocr-enqueue (path node-id file)
+  "Queue the sketch at PATH for recognition, restarting its quiet period.
+NODE-ID and FILE identify the link whose drawer receives the result."
+  (when (org-writenotes--ocr-available-p)
+    ;; Resolve now: the active node may differ by the time the job runs.
+    (let ((id (if (and node-id (string-match-p "\\`file:.*::\\(id:\\|line:\\)" node-id))
+                  node-id
+                org-writenotes--active-node-id)))
+      (when id
+        (puthash path (list :node-id id :file file :time (float-time))
+                 org-writenotes--ocr-pending)
+        (org-writenotes--ocr-ensure-timer)))))
+
+(defun org-writenotes--ocr-next-due ()
+  "Return a (PATH . ENTRY) pair from the queue that may run now, or nil."
+  (catch 'due
+    (maphash (lambda (path entry)
+               (when (or org-writenotes--ocr-flush
+                         (org-writenotes--ocr-quiet-p (plist-get entry :time)))
+                 (throw 'due (cons path entry))))
+             org-writenotes--ocr-pending)
+    nil))
+
+(defun org-writenotes--ocr-read-bytes (path)
+  "Return the raw (unibyte) contents of the file at PATH."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally path)
+    (buffer-string)))
+
+(defun org-writenotes--ocr-parse-output (stdout)
+  "Return the recognised text from the helper's JSON STDOUT, or nil if unparsable."
+  (condition-case nil
+      (let* ((line (car (last (split-string stdout "\n" t))))
+             (obj (json-parse-string line :object-type 'alist :array-type 'list)))
+        (string-join (alist-get 'lines obj) "\n"))
+    (error nil)))
+
+(defun org-writenotes--ocr-finish-process (proc out err callback)
+  "Collect the result of the exited helper PROC and pass it to CALLBACK.
+OUT and ERR are its stdout and stderr buffers.  CALLBACK gets the recognised
+text, or nil if the helper failed."
+  (let ((ok (and (eq (process-status proc) 'exit)
+                 (zerop (process-exit-status proc))))
+        (stdout (and (buffer-live-p out) (with-current-buffer out (buffer-string))))
+        (stderr (and (buffer-live-p err) (with-current-buffer err (buffer-string)))))
+    (dolist (buf (list out err))
+      (when (buffer-live-p buf) (kill-buffer buf)))
+    (setq org-writenotes--ocr-process nil)
+    (unless ok
+      (message "org-writenotes: OCR helper failed: %s"
+               (string-trim (substring (or stderr "") (max 0 (- (length stderr) 300))))))
+    (funcall callback (and ok (org-writenotes--ocr-parse-output (or stdout ""))))))
+
+(defun org-writenotes--ocr-run-helper (bytes callback)
+  "Run the OCR helper on the `.svgz' BYTES without blocking Emacs.
+When it exits, CALLBACK is called with the recognised text (possibly empty),
+or nil if the helper failed."
+  (let* ((out (generate-new-buffer " *org-writenotes-ocr*"))
+         (err (generate-new-buffer " *org-writenotes-ocr-err*"))
+         (command (append (list org-writenotes-ocr-python org-writenotes-ocr-script
+                                "--device" org-writenotes-ocr-device)
+                          (when org-writenotes-ocr-model
+                            (list "--model" org-writenotes-ocr-model))))
+         (proc (make-process
+                :name "org-writenotes-ocr" :buffer out :stderr err
+                :command command :connection-type 'pipe :noquery t
+                :coding '(utf-8 . binary)
+                :sentinel (lambda (p _event)
+                            (when (memq (process-status p) '(exit signal))
+                              (org-writenotes--ocr-finish-process p out err callback))))))
+    (process-put proc 'ocr-buffers (list out err))
+    (setq org-writenotes--ocr-process proc)
+    (process-send-string proc bytes)
+    (process-send-eof proc)))
+
+(defun org-writenotes--ocr-complete (path entry hash text)
+  "Record the TEXT recognised for PATH (ENTRY, content HASH) and run the next job."
+  (unwind-protect
+      (when text
+        (puthash path hash org-writenotes--ocr-done)
+        ;; A newer commit is already queued; its own run will supersede this text.
+        (unless (gethash path org-writenotes--ocr-pending)
+          (org-writenotes--update-ocr-drawer
+           (plist-get entry :node-id) (plist-get entry :file) text t)))
+    (run-at-time 0 nil #'org-writenotes--ocr-tick)))
+
+(defun org-writenotes--ocr-start (path entry)
+  "Begin recognising the sketch at PATH, taking it off the queue.
+ENTRY is its queue plist.  Sketches whose bytes were already recognised, or
+that no longer exist, are dropped without starting the helper."
+  (remhash path org-writenotes--ocr-pending)
+  (when (file-exists-p path)
+    (let* ((bytes (org-writenotes--ocr-read-bytes path))
+           (hash (secure-hash 'sha1 bytes)))
+      (unless (equal hash (gethash path org-writenotes--ocr-done))
+        (condition-case err
+            (org-writenotes--ocr-run-helper
+             bytes (lambda (text) (org-writenotes--ocr-complete path entry hash text)))
+          (error (message "org-writenotes: cannot start OCR helper: %s"
+                          (error-message-string err))))))))
+
+(defun org-writenotes--ocr-tick ()
+  "Start the next queued sketch that is due, if no recognition is running.
+If OCR was switched off or the helper removed, drop the queue instead."
+  (unless (org-writenotes--ocr-available-p)
+    (clrhash org-writenotes--ocr-pending))
+  (let (due)
+    (while (and (not (process-live-p org-writenotes--ocr-process))
+                (setq due (org-writenotes--ocr-next-due)))
+      (org-writenotes--ocr-start (car due) (cdr due))))
+  (when (zerop (hash-table-count org-writenotes--ocr-pending))
+    (unless (process-live-p org-writenotes--ocr-process)
+      (setq org-writenotes--ocr-flush nil))
+    (org-writenotes--ocr-cancel-timer)))
+
+;;;###autoload
+(defun org-writenotes-ocr-run-now ()
+  "Recognise all queued sketches now, without waiting for Emacs to go idle."
+  (interactive)
+  (let ((count (hash-table-count org-writenotes--ocr-pending)))
+    (cond
+     ((not org-writenotes-ocr-enabled)
+      (user-error "OCR is off; enable it with (setq org-writenotes-ocr-enabled t)"))
+     ((not (file-executable-p org-writenotes-ocr-python))
+      (user-error "OCR Python not found: %s (see `org-writenotes-ocr-python')"
+                  org-writenotes-ocr-python))
+     ((not (file-readable-p org-writenotes-ocr-script))
+      (user-error "OCR script not found: %s (see `org-writenotes-ocr-script')"
+                  org-writenotes-ocr-script))
+     ((zerop count)
+      (message "org-writenotes: no sketches waiting for OCR"))
+     (t
+      (setq org-writenotes--ocr-flush t)
+      (org-writenotes--ocr-ensure-timer)
+      (org-writenotes--ocr-tick)
+      (message "org-writenotes: recognising %d sketch(es)..." count)))))
+
+(defun org-writenotes--ocr-shutdown ()
+  "Cancel the OCR timer, drop the queue and kill any running helper."
+  (org-writenotes--ocr-cancel-timer)
+  (clrhash org-writenotes--ocr-pending)
+  (setq org-writenotes--ocr-flush nil)
+  (when (process-live-p org-writenotes--ocr-process)
+    (set-process-sentinel org-writenotes--ocr-process #'ignore)
+    (delete-process org-writenotes--ocr-process)
+    (dolist (buf (process-get org-writenotes--ocr-process 'ocr-buffers))
+      (when (buffer-live-p buf) (kill-buffer buf))))
+  (setq org-writenotes--ocr-process nil))
+
 (defun org-writenotes--handle-ink-commit (params)
   "Write base64-encoded `.svgz' bytes from PARAMS to the common directory.
 Refresh the inline display and update the folded :WRITENOTES_OCR: drawer
@@ -2241,34 +2607,12 @@ if OCR text is provided."
                            (base64-decode-string b64))))
       (remhash abs-path org-writenotes--live-svg-cache)
       (org-writenotes--write-raw-bytes abs-path raw-bytes)
-      ;; Update folded :WRITENOTES_OCR: drawer beneath the link in the Org buffer
       (when loc
-        (with-current-buffer (car loc)
-          (save-excursion
-            (goto-char (cdr loc))
-            (let* ((end (save-excursion (org-end-of-subtree t t) (point)))
-                   (link-re (format "\\[\\[\\(?:file:\\|attachment:\\)[^]\n]*?%s\\(?:\\]\\[[^]\n]*\\)?\\]\\]"
-                                    (regexp-quote bare-filename))))
-              (when (re-search-forward link-re end t)
-                (let ((had-drawer nil)
-                      (trimmed-ocr (when (and ocr-text (stringp ocr-text))
-                                     (string-trim ocr-text))))
-                  ;; Check and clean up any existing duplicate drawer(s) following the link
-                  (save-excursion
-                    (skip-chars-forward " \t\n")
-                    (beginning-of-line)
-                    (let ((drawer-re "^[ \t]*:WRITENOTES_OCR:[ \t]*\n[^z-a]*?^[ \t]*:END:[ \t]*\n?"))
-                      (while (looking-at drawer-re)
-                        (setq had-drawer t)
-                        (replace-match "" t t))))
-                  ;; Insert single clean drawer only if auto-sync is enabled OR a drawer was already present
-                  (when (and trimmed-ocr (not (string-empty-p trimmed-ocr))
-                             (or org-writenotes-auto-sync-ocr-drawer had-drawer))
-                    (end-of-line)
-                    (insert (format "\n:WRITENOTES_OCR:\n%s\n:END:\n" trimmed-ocr)))
-                  (when (or had-drawer (and org-writenotes-auto-sync-ocr-drawer
-                                            trimmed-ocr (not (string-empty-p trimmed-ocr))))
-                    (save-buffer))))))))
+        ;; With the idle recognizer available, a commit without OCR text leaves the
+        ;; existing drawer in place; it is replaced once fresh text has been computed.
+        (unless (and (null ocr-text) (org-writenotes--ocr-available-p))
+          (org-writenotes--update-ocr-drawer node-id bare-filename ocr-text))
+        (org-writenotes--ocr-enqueue abs-path node-id bare-filename))
       (org-writenotes--refresh-inline-image abs-path)
       `(:savedPath ,abs-path :bytesWritten ,(length raw-bytes)))))
 
@@ -2702,6 +3046,7 @@ When VERBOSE is non-nil, report the outcome."
 (defun org-writenotes-stop-server ()
   "Stop the Org-WriteNotes server and disconnect clients."
   (interactive)
+  (org-writenotes--ocr-shutdown)
   (when (timerp org-writenotes--adb-watchdog-timer)
     (cancel-timer org-writenotes--adb-watchdog-timer)
     (setq org-writenotes--adb-watchdog-timer nil))

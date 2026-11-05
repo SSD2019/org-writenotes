@@ -30,10 +30,11 @@ Write structured notes, manage tasks, execute Babel code blocks, and sketch high
   - **Tiled Large-Canvas Rendering:** Viewport-culled tiled rendering (`nativeRenderTileToBitmap`) for massive diagrams (>16 MP).
 
 ### 2. Smart Ink: Offline OCR, Audio Sync & Image Markup
-- **100% On-Device Handwriting OCR (Google ML Kit):**
-  - **Lasso → Convert to Text:** Convert selected handwritten notes into native Org paragraphs or checklist items on the fly.
+- **Handwriting OCR:**
+  - **Idle-Time Recognition on the Emacs Host (TrOCR):** Sketches are never recognized per commit. Each commit queues the sketch in Emacs, and a local [TrOCR](https://huggingface.co/microsoft/trocr-base-handwritten) helper (`ocr/recognize.py`) runs only after Emacs has been idle, and the sketch untouched, for `org-writenotes-ocr-idle-seconds` (default 3 minutes). It uses the GPU when present and falls back to CPU. See [Setting up local OCR](#setting-up-local-ocr).
+  - **Searchable `:WRITENOTES_OCR:` Drawers:** The recognized text is written into a folded Org drawer beneath each sketch link, replacing the previous one, so `isearch`, `ripgrep`, `consult-line`, and `org-ql` search inside your diagrams natively.
+  - **Lasso → Convert to Text:** Convert selected handwritten notes into native Org paragraphs or checklist items on the fly (still uses the tablet's built-in basic recognizer).
   - **Smart Math & Checklist Detection:** Automatically converts drawn `[ ]` boxes into interactive Org checklists and handwritten math expressions into LaTeX (`$...$`).
-  - **Searchable `:WRITENOTES_OCR:` Drawers:** Optionally index recognized handwriting inside folded Org drawers beneath each sketch link so `isearch`, `ripgrep`, `consult-line`, and `org-ql` search inside your diagrams natively.
 - **Audio-Synced Sketches:** Record voice notes while sketching; each pen stroke is timestamp-indexed to the audio track so you can jump backward/forward stroke-by-stroke during playback.
 - **Image & Diagram Annotation:**
   - Run `M-x org-writenotes-annotate-image-at-point` in Emacs on any `[[file:diagram.png]]` link to wrap it as a background template and open it on the tablet for stylus markup.
@@ -119,7 +120,7 @@ flowchart LR
 | [`emacs/org-writenotes-extras.el`](emacs/org-writenotes-extras.el) | Extended capabilities: atomic writes, `.history/` version snapshots, `etag` conflict copies, Tailscale pairing, `org-roam` sketch backlinks, link repair, `ox-html` inline SVG export, and `C-c w` transient menu. |
 | [`docs/protocol-spec.md`](docs/protocol-spec.md) | JSON-RPC 2.0 over WebSocket wire protocol specification (`session.hello`, `node.*`, `ink.*`, `emacs.*`, `presence.*`). |
 | [`android/app/src/main/cpp/write_bridge_jni.cpp`](android/app/src/main/cpp/write_bridge_jni.cpp) | C++ JNI bridge (`NativeCanvasSession`) wrapping Stylus Labs Write's `Document`, `Page`, `StrokeBuilder`, shape recognizer, paper templates, tiled renderer, and `.svgz` serializer. |
-| [`android/app/src/main/java/com/orgwritenotes/ink/`](android/app/src/main/java/com/orgwritenotes/ink/) | `WriteCanvasBlockView` (stylus input, palm rejection, gestures), `HandwritingOcrEngine` (ML Kit), `OcrSmartInsert`, `AudioSketch`, `SvgLayers`, and `StrokeTuning`. |
+| [`android/app/src/main/java/com/orgwritenotes/ink/`](android/app/src/main/java/com/orgwritenotes/ink/) | `WriteCanvasBlockView` (stylus input, palm rejection, gestures), `HandwritingOcrEngine` (basic stroke recognizer for the lasso dialog), `OcrSmartInsert`, `AudioSketch`, `SvgLayers`, and `StrokeTuning`. |
 | [`android/app/src/main/java/com/orgwritenotes/sync/`](android/app/src/main/java/com/orgwritenotes/sync/) | `EmacsSyncClient` (WebSocket JSON-RPC client, auto-reconnect, mutation coalescing), `OfflineStore` (SQLite persistence), and `AppLogger`. |
 | [`android/app/src/main/java/com/orgwritenotes/ui/`](android/app/src/main/java/com/orgwritenotes/ui/) | Jetpack Compose tablet UI: `OrgWriteNotesTabletScreen`, `WriteZoomedEditorOverlay`, `WriteSplitPane`, and `WriteExtrasBar`. |
 
@@ -185,6 +186,7 @@ When `org-writenotes-mode` is active in an Org buffer, use the `C-c w` prefix (o
 | `M-x org-writenotes-annotate-image-at-point` | Wrap a PNG/JPEG/WebP image link at point as the background template of a new `.svgz` sketch and open on the tablet. |
 | `M-x org-writenotes-delete-sketch-at-point` | Delete the `.svgz` link at point and remove its file from disk. |
 | `C-c w r` / `M-x org-writenotes-revert-sketch-at-point` | Restore a previous version of the `.svgz` sketch at point from `.history/`. |
+| `M-x org-writenotes-ocr-run-now` | Recognize all queued sketches immediately, without waiting for Emacs to go idle. |
 | `C-c w b` / `M-x org-writenotes-show-sketch-backlinks` | List all Org headings (including `org-roam` files) referencing the sketch at point. |
 | `C-c w l` / `M-x org-writenotes-repair-links` | Automatically repair broken `.svgz` file links in the current buffer. |
 | `C-c w f` / `M-x org-writenotes-flag-as-flashcard` | Flag the current Org heading as an `org-drill` spaced-repetition card (`:drill:`). |
@@ -203,9 +205,34 @@ When `org-writenotes-mode` is active in an Org buffer, use the `C-c w` prefix (o
 | `org-writenotes-inline-theme` | `'auto` | Inline SVG rendering mode in Emacs (`'auto`, `'paper`, or `'transparent`). |
 | `org-writenotes-inline-max-width` | `760` | Maximum pixel width for inline `.svgz` previews in Emacs (`nil` for native width). |
 | `org-writenotes-sketch-history-depth` | `20` | Number of historical snapshots retained per sketch inside `.history/`. |
-| `org-writenotes-auto-sync-ocr-drawer` | `nil` | When non-nil, automatically insert/update folded `:WRITENOTES_OCR:` drawers on ink commit. |
+| `org-writenotes-auto-sync-ocr-drawer` | `nil` | When non-nil, automatically insert/update folded `:WRITENOTES_OCR:` drawers for OCR text sent by a client on ink commit. |
+| `org-writenotes-ocr-enabled` | `nil` | Set to `t` to recognize sketches with the local TrOCR helper (requires the setup below). |
+| `org-writenotes-ocr-idle-seconds` | `180` | Seconds Emacs must be idle, and a sketch left untouched, before OCR runs. |
+| `org-writenotes-ocr-python` | `~/.cache/org-writenotes-ocr/venv/bin/python` | Python interpreter (with torch, transformers, cairosvg) that runs the helper. |
+| `org-writenotes-ocr-script` | `ocr/recognize.py` next to `emacs/` | Path to the OCR helper script. |
+| `org-writenotes-ocr-device` | `"auto"` | `"auto"`, `"cuda"` or `"cpu"`. |
+| `org-writenotes-ocr-model` | `nil` | TrOCR model, picked from a menu in `M-x customize-variable` or entered as a Hugging Face id or local path (default `microsoft/trocr-base-handwritten`). |
 | `org-writenotes-live-stroke-preview` | `nil` | When non-nil, splice incoming `ink.delta` strokes into Emacs inline previews in real time. |
 | `org-writenotes-html-inline-svgz` | `t` | Inline `.svgz` links directly as `<svg>` elements during `ox-html` export. |
+
+---
+
+## Setting up local OCR
+
+Handwriting is recognized on the machine that runs Emacs, with [TrOCR](https://huggingface.co/microsoft/trocr-base-handwritten). Nothing leaves the machine; the model is downloaded once from Hugging Face on first use (about 1.3 GB).
+
+```bash
+python3 -m venv ~/.cache/org-writenotes-ocr/venv
+~/.cache/org-writenotes-ocr/venv/bin/pip install "torch>=2.6" torchvision --index-url https://download.pytorch.org/whl/cu124   # use .../whl/cpu without an NVIDIA GPU
+~/.cache/org-writenotes-ocr/venv/bin/pip install "transformers>=4.46,<5" pillow cairosvg
+```
+
+PyTorch 2.6 or newer is required: the large and small TrOCR models ship only pickle `.bin` weights, which recent transformers refuses to load on older PyTorch (CVE-2025-32434). Then turn it on with `(setq org-writenotes-ocr-enabled t)`; it is off by default.
+
+- **When it runs:** after Emacs has been idle, and the sketch left alone, for `org-writenotes-ocr-idle-seconds`. Drawing on the tablet does not count as Emacs activity, so a sketch finished while you are away is recognized a few minutes later.
+- **Run it now:** `M-x org-writenotes-ocr-run-now` recognizes all queued sketches immediately.
+- **Try the helper by hand:** `~/.cache/org-writenotes-ocr/venv/bin/python ocr/recognize.py < sketch.svgz` prints the recognized lines as JSON.
+- **Behaviour on commit:** an existing `:WRITENOTES_OCR:` drawer stays in place (stale but searchable) until fresh text replaces it. Unchanged sketches are not re-processed.
 
 ---
 
