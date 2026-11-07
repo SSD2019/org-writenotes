@@ -53,7 +53,7 @@ Use \"127.0.0.1\" for ADB USB debugging, or \"0.0.0.0\" for LAN/Tailscale."
 
 (defcustom org-writenotes-require-session-token nil
   "Whether non-loopback clients must present the session token.
-When nil, LAN / Tailscale clients may connect without a token. The token is
+When nil, LAN / Tailscale clients may connect without a token.  The token is
 still generated and shown in the pairing QR code."
   :type 'boolean
   :group 'org-writenotes)
@@ -704,7 +704,8 @@ PROPS are the `create-image' arguments.  Colors adapt to the theme and
     (message "[Org-WriteNotes] Enabled inline .svgz rendering.")))
 
 (defun org-writenotes--refresh-inline-image (&optional saved-path)
-  "Clear Emacs image cache and refresh inline images in visible Org buffers."
+  "Clear Emacs image cache and refresh inline images in visible Org buffers.
+If SAVED-PATH is non-nil, only invalidate the cache for that specific file."
   (when (fboundp 'clear-image-cache)
     (ignore-errors (clear-image-cache)))
   (when (boundp 'org-writenotes--mtime-image-cache)

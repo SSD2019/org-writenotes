@@ -83,7 +83,8 @@
             #'string>))))
 
 (defun org-writenotes--snapshot-sketch (abs-path &optional force)
-  "Copy existing ABS-PATH into history and prune to the configured depth."
+  "Copy existing ABS-PATH into history and prune to the configured depth.
+If FORCE is non-nil, create a snapshot regardless of interval."
   (when (and (> org-writenotes-sketch-history-depth 0)
              (file-exists-p abs-path)
              (let ((newest (car (org-writenotes--list-snapshots abs-path))))
@@ -544,11 +545,14 @@ advising `org-writenotes--create-image-svgz-advice' or `create-image'."
     (transient-define-prefix org-writenotes-menu ()
       "Org-WriteNotes commands."
       ["Org-WriteNotes"
-       ["Tablet"
+       ["Tablet & Companion"
         ("p" "Push node" org-writenotes-push-node)
         ("q" "Pair via LAN QR" org-writenotes-pair-qr)
-        ("t" "Pair via Tailscale" org-writenotes-pair-tailscale)]
+        ("t" "Pair via Tailscale" org-writenotes-pair-tailscale)
+        ("d" "Connect Linux desktop" org-writenotes-connect-linux)
+        ("i" "Connect iPadOS" org-writenotes-connect-ipad)]
        ["Sketches"
+        ("s" "Popup sketch at point" org-writenotes-popup-sketch-at-point)
         ("r" "Revert sketch at point" org-writenotes-revert-sketch-at-point)
         ("l" "Repair broken links" org-writenotes-repair-links)
         ("b" "Sketch backlinks" org-writenotes-show-sketch-backlinks)
@@ -559,6 +563,8 @@ advising `org-writenotes--create-image-svgz-advice' or `create-image'."
     (call-interactively
      (intern (completing-read "Org-WriteNotes: "
                               '("org-writenotes-push-node" "org-writenotes-pair-qr"
+                                "org-writenotes-connect-linux" "org-writenotes-connect-ipad"
+                                "org-writenotes-popup-sketch-at-point"
                                 "org-writenotes-revert-sketch-at-point"
                                 "org-writenotes-repair-links")
                               nil t)))))
@@ -705,6 +711,152 @@ SKETCH-NAME is compared by file name, so moved sketches still match."
       hits)))
 
 (define-key org-writenotes-command-map (kbd "b") #'org-writenotes-show-sketch-backlinks)
+
+;;; F1: Linux Desktop Companion & Quick Single-Sketch Popup ---------------------
+
+(defcustom org-writenotes-linux-command
+  (let ((apps-cmd (expand-file-name "~/dev/org-writenotes-apps/linux/org-writenotes-linux"))
+        (local-cmd (expand-file-name "../linux/org-writenotes-linux"
+                                    (file-name-directory (or load-file-name buffer-file-name
+                                                             default-directory)))))
+    (if (file-exists-p apps-cmd)
+        apps-cmd
+      local-cmd))
+  "Path to the `org-writenotes-linux' launcher for Linux Desktop."
+  :type 'file
+  :group 'org-writenotes)
+
+(defvar org-writenotes--linux-companion-proc nil
+  "Process handle for the local Linux Org-WriteNotes companion window.")
+
+;;;###autoload
+(defun org-writenotes-connect-linux ()
+  "Start the server and launch the local Linux Org-WriteNotes companion app."
+  (interactive)
+  (unless (and org-writenotes--server-proc
+               (process-live-p org-writenotes--server-proc))
+    (org-writenotes-start-server))
+  (if (and org-writenotes--linux-companion-proc
+           (process-live-p org-writenotes--linux-companion-proc))
+      (message "[Org-WriteNotes] Linux companion app is already running.")
+    (let ((cmd org-writenotes-linux-command)
+          (url (format "ws://127.0.0.1:%d" org-writenotes-port)))
+      (unless (file-executable-p cmd)
+        (user-error "Linux launcher not found or not executable: %s" cmd))
+      (setq org-writenotes--linux-companion-proc
+            (start-process "org-writenotes-linux" "*Org-WriteNotes Linux*"
+                           cmd "--url" url))
+      (message "[Org-WriteNotes] Launched Linux companion app (%s)." url))))
+
+;;;###autoload
+(defun org-writenotes-popup-sketch-at-point ()
+  "Open the `.svgz' sketch at point in a Linux single-sketch popup window.
+When the popup saves or exits, the inline `.svgz' image in Emacs is refreshed."
+  (interactive)
+  (let ((path (org-writenotes--svgz-link-at-point)))
+    (unless path
+      (let* ((line-str (buffer-substring-no-properties
+                        (line-beginning-position) (line-end-position)))
+             (matched (string-match
+                       "\\[\\[\\(?:file:\\|attachment:\\)?\\([^]\n]+\\.svgz?\\)"
+                       line-str)))
+        (when matched
+          (setq path (expand-file-name
+                      (file-name-nondirectory (match-string 1 line-str))
+                      (org-writenotes--resolve-image-dir (buffer-file-name)))))))
+    (unless path
+      (user-error "No .svgz sketch link at point"))
+    (unless (and org-writenotes--server-proc
+                 (process-live-p org-writenotes--server-proc))
+      (org-writenotes-start-server))
+    (let* ((cmd org-writenotes-linux-command)
+           (org-file (or (buffer-file-name) ""))
+           (node-id (save-excursion
+                      (or (ignore-errors
+                            (org-back-to-heading t)
+                            (org-writenotes--node-id-at-point t))
+                          "")))
+           (url (format "ws://127.0.0.1:%d" org-writenotes-port)))
+      (unless (file-executable-p cmd)
+        (user-error "Linux launcher not found or not executable: %s" cmd))
+      (let ((proc (start-process
+                   "org-writenotes-popup" "*Org-WriteNotes Popup*"
+                   cmd "--sketch" path "--node" node-id
+                   "--org-file" org-file "--url" url)))
+        (set-process-sentinel
+         proc
+         (lambda (_p _ev)
+           (when (file-exists-p path)
+             (remhash path org-writenotes--live-svg-cache)
+             (org-writenotes--refresh-inline-image path))))
+        (message "[Org-WriteNotes] Opened %s in Linux sketch popup."
+                 (file-name-nondirectory path))
+        proc))))
+
+(define-key org-writenotes-command-map (kbd "d") #'org-writenotes-connect-linux)
+(define-key org-writenotes-command-map (kbd "s") #'org-writenotes-popup-sketch-at-point)
+
+;;; F2: iPadOS Companion Connection (LAN / Tailscale QR + USB iproxy) --------
+
+(defcustom org-writenotes-ipad-usb-command "iproxy"
+  "Executable used for USB port forwarding to an iPad via `libimobiledevice'."
+  :type 'string
+  :group 'org-writenotes)
+
+(defvar org-writenotes--ipad-tunnel-proc nil
+  "Process handle for optional `iproxy' USB port forwarding to iPadOS.")
+
+(defun org-writenotes--format-ipad-connect-uri (host port &optional token)
+  "Format an `orgwritenotes://connect' deep-link URI for iPadOS with HOST and PORT.
+Optional TOKEN is included if non-nil."
+  (format "orgwritenotes://connect?host=%s&port=%d&token=%s"
+          (url-hexify-string (or host "127.0.0.1"))
+          (or port org-writenotes-port)
+          (url-hexify-string (or token ""))))
+
+;;;###autoload
+(defun org-writenotes-connect-ipad (&optional use-usb)
+  "Start the server and display pairing info / deep-link QR for iPadOS.
+With prefix arg USE-USB (or when `iproxy' is requested), also starts a USB
+port-forwarding tunnel via `libimobiledevice'."
+  (interactive "P")
+  (unless (and org-writenotes--server-proc
+               (process-live-p org-writenotes--server-proc))
+    (org-writenotes-start-server))
+  (when (and use-usb (executable-find org-writenotes-ipad-usb-command))
+    (when (and org-writenotes--ipad-tunnel-proc
+               (process-live-p org-writenotes--ipad-tunnel-proc))
+      (delete-process org-writenotes--ipad-tunnel-proc))
+    (let ((port-str (number-to-string org-writenotes-port)))
+      (setq org-writenotes--ipad-tunnel-proc
+            (start-process "org-writenotes-iproxy" "*Org-WriteNotes iproxy*"
+                           org-writenotes-ipad-usb-command port-str port-str))))
+  (let* ((host (or (org-writenotes--get-tailscale-ip)
+                   (and (fboundp 'org-writenotes--detect-lan-ip)
+                        (org-writenotes--detect-lan-ip))
+                   org-writenotes-host
+                   "127.0.0.1"))
+         (token (or org-writenotes--session-token ""))
+         (uri (org-writenotes--format-ipad-connect-uri
+               (if use-usb "127.0.0.1" host) org-writenotes-port token))
+         (buf (get-buffer-create "*Org-WriteNotes iPadOS Pairing*")))
+    (with-current-buffer buf
+      (read-only-mode -1)
+      (erase-buffer)
+      (insert "=== Org-WriteNotes iPadOS Companion Pairing ===\n\n")
+      (insert (format "Host           : %s\n" (if use-usb "127.0.0.1 (USB iproxy)" host)))
+      (insert (format "Port           : %d\n" org-writenotes-port))
+      (insert (format "Session Token  : %s\n" token))
+      (insert (format "iPadOS URI     : %s\n\n" uri))
+      (when (executable-find "qrencode")
+        (insert (shell-command-to-string
+                 (format "qrencode -t UTF8 %s" (shell-quote-argument uri))))
+        (insert "\n"))
+      (read-only-mode 1))
+    (pop-to-buffer buf)
+    uri))
+
+(define-key org-writenotes-command-map (kbd "i") #'org-writenotes-connect-ipad)
 
 (provide 'org-writenotes-extras)
 ;;; org-writenotes-extras.el ends here

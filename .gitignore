@@ -1,13 +1,19 @@
-.android-sdk/
+# Emacs
+*.elc
+*~
+.#*
+\#*#
+.cache/
+
+# Python / OCR
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Analysis & temporary
 graphify-out/
 .graphify/
 .graphify*
-android/local.properties
-android/.gradle/
-android/build/
-android/app/build/
-android/app/.cxx/
-
-android/hs_err_pid*.log
-android/replay_pid*.log
-.gradle/
+*.log
+.DS_Store

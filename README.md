@@ -1,8 +1,12 @@
-# Org-WriteNotes
+# Org-WriteNotes (Emacs Server Plugin)
 
-**Org-WriteNotes** is a hybrid Android tablet companion app and zero-dependency GNU Emacs package (`org-writenotes.el`) for editing Org-mode documents with embedded, dynamically expanding handwritten ink canvases powered by the **[Stylus Labs Write](https://github.com/styluslabs/Write)** C++ engine.
+**Org-WriteNotes** is a zero-dependency GNU Emacs package (`org-writenotes.el` & `org-writenotes-extras.el`) that turns Emacs into a live bidirectional sync server for handwritten ink canvases and Org-mode document trees.
 
-Write structured notes, manage tasks, execute Babel code blocks, and sketch high-precision vector diagrams with an S-Pen or USI stylus—all stored natively in your `.org` files and standard `.svgz` vector files with zero cloud lock-in.
+> [!NOTE]
+> Client applications (Android tablet, Linux Desktop companion, and iOS/iPadOS) are maintained in the companion apps repository:
+> **[`~/dev/org-writenotes-apps`](file:///home/saisan/dev/org-writenotes-apps)**.
+
+Write structured notes, manage tasks, execute Babel code blocks, and sketch high-precision vector diagrams with an S-Pen, Apple Pencil, or Wacom stylus—all stored natively in your `.org` files and standard `.svgz` vector files with zero cloud lock-in.
 
 ---
 
@@ -119,7 +123,10 @@ flowchart LR
 | [`emacs/org-writenotes.el`](emacs/org-writenotes.el) | Core Emacs package: RFC 6455 WebSocket server, JSON-RPC 2.0 dispatcher, Org AST parser/mutator, adaptive `.svgz` inline image renderer, and `org-writenotes-follow-mode`. |
 | [`emacs/org-writenotes-extras.el`](emacs/org-writenotes-extras.el) | Extended capabilities: atomic writes, `.history/` version snapshots, `etag` conflict copies, Tailscale pairing, `org-roam` sketch backlinks, link repair, `ox-html` inline SVG export, and `C-c w` transient menu. |
 | [`docs/protocol-spec.md`](docs/protocol-spec.md) | JSON-RPC 2.0 over WebSocket wire protocol specification (`session.hello`, `node.*`, `ink.*`, `emacs.*`, `presence.*`). |
-| [`android/app/src/main/cpp/write_bridge_jni.cpp`](android/app/src/main/cpp/write_bridge_jni.cpp) | C++ JNI bridge (`NativeCanvasSession`) wrapping Stylus Labs Write's `Document`, `Page`, `StrokeBuilder`, shape recognizer, paper templates, tiled renderer, and `.svgz` serializer. |
+| [`android/app/src/main/cpp/write_bridge_jni.cpp`](android/app/src/main/cpp/write_bridge_jni.cpp) | C++ JNI & portable C ABI (`wn_session_*`) bridge (`NativeCanvasSession`) wrapping Stylus Labs Write's `Document`, `Page`, `StrokeBuilder`, shape recognizer, paper templates, tiled renderer, and `.svgz` serializer across Android, Linux Desktop, and iPadOS. |
+| [`android/app/src/main/cpp/linux_stylus_input.cpp`](android/app/src/main/cpp/linux_stylus_input.cpp) | Native Linux stylus & touch manager (`XInput2` + XWayland tablet devices + Linux kernel `evdev` `/dev/input/event*`) supporting Wacom EMR, USI, AES, pressure, tilt (`tiltX`, `tiltY`), eraser tail (`BTN_TOOL_RUBBER`), and barrel buttons (`BTN_STYLUS`, `BTN_STYLUS2`). |
+| [`android/desktop/`](android/desktop/) | Kotlin Compose Desktop (`:desktop`) module sharing 100% of the Compose UI, `WriteCanvasBlockView`, and `EmacsSyncClient` on Linux (X11 & Wayland). |
+| [`linux/org-writenotes-linux`](linux/org-writenotes-linux) | Linux launcher supporting Full Companion Mode, Quick Single-Sketch Popup Mode (`--sketch <file.svgz>`), and stylus device diagnostics (`--devices`). |
 | [`android/app/src/main/java/com/orgwritenotes/ink/`](android/app/src/main/java/com/orgwritenotes/ink/) | `WriteCanvasBlockView` (stylus input, palm rejection, gestures), `HandwritingOcrEngine` (basic stroke recognizer for the lasso dialog), `OcrSmartInsert`, `AudioSketch`, `SvgLayers`, and `StrokeTuning`. |
 | [`android/app/src/main/java/com/orgwritenotes/sync/`](android/app/src/main/java/com/orgwritenotes/sync/) | `EmacsSyncClient` (WebSocket JSON-RPC client, auto-reconnect, mutation coalescing), `OfflineStore` (SQLite persistence), and `AppLogger`. |
 | [`android/app/src/main/java/com/orgwritenotes/ui/`](android/app/src/main/java/com/orgwritenotes/ui/) | Jetpack Compose tablet UI: `OrgWriteNotesTabletScreen`, `WriteZoomedEditorOverlay`, `WriteSplitPane`, and `WriteExtrasBar`. |
@@ -169,6 +176,41 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb reverse tcp:9876 tcp:9876
 ```
 
+### 3. Running on Linux Tablet / Laptop (Wacom EMR / USI / AES Stylus)
+
+The `:desktop` module builds `liborgwritenotes_jni.so` (Stylus Labs Write C++ engine + native Linux `XInput2` and kernel `evdev` stylus subsystem) and runs the full Compose UI natively on Linux (both Wayland and X11):
+
+```bash
+# 1. Full Companion App Mode (auto-connects to local Emacs on ws://127.0.0.1:9876)
+./linux/org-writenotes-linux
+
+# 2. Quick Single-Sketch Popup Mode (opens a single .svgz directly in full-screen stylus mode)
+./linux/org-writenotes-linux --sketch /path/to/writenotes/diagram.svgz
+
+# 3. Inspect detected Linux XInput2 / evdev stylus & touch hardware
+./linux/org-writenotes-linux --devices
+```
+
+> **Note (Wayland / Kernel `evdev` Stylus Axes):** On X11 and XWayland, Wacom EMR / USI / AES pressure, tilt, eraser tip, and barrel buttons are read automatically via `XInput2`. For direct kernel `/dev/input/event*` access under Wayland, ensure your user is in the `input` group (`sudo usermod -aG input $USER`).
+
+### 4. Running on iPadOS (Apple Pencil 1st/2nd Gen, USB-C, & Apple Pencil Pro)
+
+The `ios/` Swift Package and `android/ios-kmp/` Kotlin Multiplatform `cinterop` module wrap the exact same C++ Stylus Labs Write engine (`write_bridge_c_api.h` / `liborgwritenotes_c_static.a`) and support:
+- **240Hz Coalesced Touches & ProMotion 120Hz Predicted Wet-Ink** (`WriteCanvasUIView.swift`)
+- **Altitude & Azimuth Tilt + Normalized Pressure** (with USB-C Apple Pencil fallback)
+- **Apple Pencil Pro Barrel Roll (`rollAngle`)** mapped dynamically to chisel nib angle (`chiselAngle`)
+- **Apple Pencil Hover (`UIHoverGestureRecognizer` `zOffset`)**, **2nd Gen Double-Tap**, and **Apple Pencil Pro Squeeze** (`UIPencilInteraction`) to open the floating radial tool palette
+
+```bash
+# Option A: Open directly in Xcode on macOS and deploy to iPad / Simulator
+open ios/Package.swift
+
+# Option B: Build universal OrgWriteNotesEngine.xcframework (iPadOS arm64 + Simulator)
+./ios/build_xcframework.sh
+```
+
+In Emacs, run `M-x org-writenotes-connect-ipad` (`C-c w i`) to display a deep-link QR code (`orgwritenotes://connect?host=...&port=9876&token=...`) or pass `C-u M-x org-writenotes-connect-ipad` to tunnel over USB via `iproxy 9876 9876`.
+
 ---
 
 ## Emacs Commands & Keybindings
@@ -178,6 +220,9 @@ When `org-writenotes-mode` is active in an Org buffer, use the `C-c w` prefix (o
 | Key / Command | Description |
 | :--- | :--- |
 | `M-x org-writenotes-connect-adb` | Start the WebSocket server and run `adb reverse tcp:9876 tcp:9876` for USB pairing. |
+| `C-c w d` / `M-x org-writenotes-connect-linux` | Start the WebSocket server and launch the local Linux Desktop companion app (`org-writenotes-linux`). |
+| `C-c w s` / `M-x org-writenotes-popup-sketch-at-point` | Open the `.svgz` sketch at point directly in a Linux single-sketch popup window and auto-refresh inline on save/close. |
+| `C-c w i` / `M-x org-writenotes-connect-ipad` | Start the server (optionally with `iproxy` USB port forwarding) and display an `orgwritenotes://connect` QR code for iPadOS. |
 | `C-c w q` / `M-x org-writenotes-pair-qr` | Start the server on LAN and display a QR code + session token for wireless pairing. |
 | `C-c w t` / `M-x org-writenotes-pair-tailscale` | Bind to your Tailscale IPv4 (`100.x.y.z`) and generate a Tailscale pairing QR code. |
 | `C-c w p` / `M-x org-writenotes-push-node` | Push the Org subtree at point to the connected tablet. |
@@ -247,9 +292,4 @@ emacs -Q --batch -L emacs \
   -f ert-run-tests-batch-and-exit
 ```
 
-Run the Android JVM unit and protocol golden tests:
-
-```bash
-cd android
-./gradlew testDebugUnitTest
-```
+For client application tests (Android, Compose Desktop, iOS), see the [`~/dev/org-writenotes-apps`](file:///home/saisan/dev/org-writenotes-apps) repository.

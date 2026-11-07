@@ -235,3 +235,51 @@
   (let ((frame (org-writenotes--ws-encode-frame (make-string 300 ?a))))
     (should (null (org-writenotes--ws-frame-needed (substring frame 0 3))))
     (should (= (org-writenotes--ws-frame-needed (substring frame 0 4)) (length frame)))))
+
+(ert-deftest org-writenotes-extras-linux-commands ()
+  "F1: Linux companion and single-sketch popup commands invoke the launcher."
+  (should (eq (lookup-key org-writenotes-command-map (kbd "d"))
+              #'org-writenotes-connect-linux))
+  (should (eq (lookup-key org-writenotes-command-map (kbd "s"))
+              #'org-writenotes-popup-sketch-at-point))
+  (org-writenotes-test--with-dir d
+    (let* ((org-file (expand-file-name "linux-test.org" d))
+           (svgz-file (expand-file-name "writenotes/sketch1.svgz" d))
+           (spawned-args nil)
+           (dummy-proc (make-pipe-process :name "wn-linux-test" :noquery t)))
+      (unwind-protect
+          (progn
+            (make-directory (file-name-directory svgz-file) t)
+            (with-temp-file svgz-file (insert "dummy"))
+            (with-current-buffer (find-file-noselect org-file)
+              (org-mode)
+              (insert "* Heading\n:PROPERTIES:\n:ID: linux-node-1\n:END:\n[[file:./writenotes/sketch1.svgz]]\n")
+              (save-buffer)
+              (goto-char (point-min))
+              (search-forward "sketch1.svgz")
+              (cl-letf (((symbol-function 'org-writenotes-start-server) #'ignore)
+                        ((symbol-function 'start-process)
+                         (lambda (_name _buf &rest args)
+                           (setq spawned-args args)
+                           dummy-proc)))
+                (org-writenotes-popup-sketch-at-point)
+                (should (member "--sketch" spawned-args))
+                (should (member svgz-file spawned-args)))
+              (kill-buffer)))
+        (delete-process dummy-proc)))))
+
+(ert-deftest org-writenotes-extras-ipad-commands ()
+  "F2: iPadOS pairing URI generation and command keybinding work as expected."
+  (should (eq (lookup-key org-writenotes-command-map (kbd "i"))
+              #'org-writenotes-connect-ipad))
+  (let ((uri (org-writenotes--format-ipad-connect-uri "100.64.1.12" 9876 "tok123")))
+    (should (equal uri "orgwritenotes://connect?host=100.64.1.12&port=9876&token=tok123")))
+  (let ((org-writenotes--session-token "secret-ipad-tok")
+        (org-writenotes-port 9876))
+    (cl-letf (((symbol-function 'org-writenotes-start-server) #'ignore)
+              ((symbol-function 'org-writenotes--get-tailscale-ip) (lambda () "100.88.1.9"))
+              ((symbol-function 'pop-to-buffer) #'ignore))
+      (let ((generated (org-writenotes-connect-ipad nil)))
+        (should (equal generated
+                       "orgwritenotes://connect?host=100.88.1.9&port=9876&token=secret-ipad-tok"))))))
+
