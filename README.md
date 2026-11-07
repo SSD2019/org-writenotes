@@ -4,7 +4,7 @@
 
 > [!NOTE]
 > Client applications (Android tablet, Linux Desktop companion, and iOS/iPadOS) are maintained in the companion apps repository:
-> **[`~/dev/org-writenotes-apps`](file:///home/saisan/dev/org-writenotes-apps)**.
+> **[`SSD2019/org-writenotes-apps`](https://github.com/SSD2019/org-writenotes-apps)**.
 
 Write structured notes, manage tasks, execute Babel code blocks, and sketch high-precision vector diagrams with an S-Pen, Apple Pencil, or Wacom stylus—all stored natively in your `.org` files and standard `.svgz` vector files with zero cloud lock-in.
 
@@ -292,4 +292,4 @@ emacs -Q --batch -L emacs \
   -f ert-run-tests-batch-and-exit
 ```
 
-For client application tests (Android, Compose Desktop, iOS), see the [`~/dev/org-writenotes-apps`](file:///home/saisan/dev/org-writenotes-apps) repository.
+For client application tests (Android, Compose Desktop, iOS), see the [`org-writenotes-apps`](https://github.com/SSD2019/org-writenotes-apps) repository.
