@@ -48,6 +48,7 @@
 
 (defun org-writenotes--write-raw-bytes-atomic (filepath raw-bytes)
   "Atomically write unibyte RAW-BYTES to FILEPATH (temp file + rename)."
+  (remhash (expand-file-name filepath) org-writenotes--svgz-cache)
   (let ((file-name-handler-alist nil)
         (coding-system-for-write 'no-conversion)
         (write-region-inhibit-fsync nil)
@@ -138,6 +139,8 @@ If FORCE is non-nil, create a snapshot regardless of interval."
          (snap (expand-file-name (file-name-nondirectory (alist-get 'snapshot params))
                                  (org-writenotes--history-dir abs)))
          (bytes (org-writenotes--restore-snapshot abs snap)))
+    (org-writenotes--notify-node-peers
+     (alist-get 'nodeId params) org-writenotes--in-rpc-client)
     `(:svgzBase64 ,(base64-encode-string bytes t)
       :etag ,(secure-hash 'sha1 bytes))))
 
@@ -198,7 +201,9 @@ previous file is snapshotted and the conflict copy moved into `.history/'."
       (org-writenotes--snapshot-sketch abs t)
       (remhash abs org-writenotes--live-svg-cache)
       (org-writenotes--write-raw-bytes abs bytes)
-      (org-writenotes--refresh-inline-image abs))
+      (org-writenotes--refresh-inline-image abs)
+      (org-writenotes--notify-node-peers
+       (alist-get 'nodeId params) org-writenotes--in-rpc-client))
     (org-writenotes--retire-conflict-copy abs copy)
     (let ((final (org-writenotes--read-raw-bytes abs)))
       `(:svgzBase64 ,(base64-encode-string final t)
@@ -224,6 +229,10 @@ previous file is snapshotted and the conflict copy moved into `.history/'."
          (choice (completing-read "Revert to: " (mapcar #'file-name-nondirectory snaps) nil t)))
     (org-writenotes--restore-snapshot
      path (expand-file-name choice (org-writenotes--history-dir path)))
+    (save-excursion
+      (when (and (derived-mode-p 'org-mode)
+                 (ignore-errors (org-back-to-heading t)))
+        (org-writenotes--notify-node-peers (org-writenotes--node-id-at-point t))))
     (message "Reverted %s to %s" (file-name-nondirectory path) choice)))
 
 ;;; A3 / A5: etag-aware ink.commit -----------------------------------------------
@@ -234,17 +243,24 @@ PARAMS is the RPC parameter alist."
   (let* ((b64 (alist-get 'svgzBase64 params))
          (abs (and (alist-get 'fileName params) b64
                    (org-writenotes--resolve-sketch-path params)))
+         (bare (and abs (file-name-nondirectory abs)))
          (new-bytes (and abs (base64-decode-string b64)))
          (new-etag (and new-bytes (secure-hash 'sha1 new-bytes)))
          (disk-etag (and abs (org-writenotes--file-etag abs)))
-         (base-etag (alist-get 'baseEtag params)))
+         (base-etag (alist-get 'baseEtag params))
+         (proc org-writenotes--in-rpc-client)
+         (pushed-etag (and (processp proc) bare
+                           (let ((ht (process-get proc 'pushed-etags)))
+                             (and (hash-table-p ht) (gethash bare ht))))))
     (cond
      ((null abs) (funcall orig params))
      ;; A5: identical bytes -> no-op (OCR drawer still updated by orig if text given)
      ((and disk-etag (equal disk-etag new-etag) (not (alist-get 'ocrText params)))
       `(:savedPath ,abs :bytesWritten 0 :etag ,new-etag :unchanged t))
-     ;; A3: file changed since the client last saw it -> keep both copies
-     ((and (stringp base-etag) disk-etag (not (equal base-etag disk-etag)))
+     ;; A3: file changed since the client last saw it (and we haven't pushed disk-etag live) -> keep both copies
+     ((and (stringp base-etag) disk-etag
+           (not (equal base-etag disk-etag))
+           (not (equal pushed-etag disk-etag)))
       (let ((conflict (format "%s.conflict-%s.svgz" (file-name-sans-extension abs)
                               (format-time-string "%Y%m%dT%H%M%S"))))
         (org-writenotes--write-raw-bytes conflict new-bytes)
@@ -254,6 +270,12 @@ PARAMS is the RPC parameter alist."
           :bytesWritten ,(length new-bytes))))
      (t
       (unless (equal disk-etag new-etag) (org-writenotes--snapshot-sketch abs))
+      (when (and (processp proc) bare new-etag)
+        (let ((ht (or (process-get proc 'pushed-etags)
+                      (let ((new-ht (make-hash-table :test 'equal)))
+                        (process-put proc 'pushed-etags new-ht)
+                        new-ht))))
+          (puthash bare new-etag ht)))
       (append (let ((org-writenotes--decoded-b64 (cons b64 new-bytes)))
                 (funcall orig params))
               `(:etag ,new-etag))))))
@@ -286,12 +308,16 @@ PROC is the client process and MSG-TEXT the raw message."
        proc `(:jsonrpc "2.0" :id ,id
               :error (:code -32001 :message "Not authenticated: send session.hello first"))))
      (extra
-      (org-writenotes--ws-send-json
-       proc
-       (condition-case err
-           `(:jsonrpc "2.0" :id ,id :result ,(funcall (cdr extra) params))
-         (error `(:jsonrpc "2.0" :id ,id
-                  :error (:code -32603 :message ,(error-message-string err)))))))
+      (let ((org-writenotes--in-rpc-client proc)
+            (param-node (and (listp params) (alist-get 'nodeId params))))
+        (when (and (processp proc) (stringp param-node))
+          (process-put proc 'active-node param-node))
+        (org-writenotes--ws-send-json
+         proc
+         (condition-case err
+             `(:jsonrpc "2.0" :id ,id :result ,(funcall (cdr extra) params))
+           (error `(:jsonrpc "2.0" :id ,id
+                    :error (:code -32603 :message ,(error-message-string err))))))))
      ((equal method "session.hello")
       (if (>= (or (process-get proc 'auth-failures) 0) org-writenotes-max-auth-failures)
           (progn
@@ -396,7 +422,8 @@ A link is repaired when exactly one file with the same basename exists."
         (org-toggle-tag org-writenotes-drill-tag 'on)
         (org-set-property "DRILL_CARD_TYPE" "simple")
         (let ((snapshot (org-writenotes--parse-subtree-at-point)))
-          (org-writenotes--broadcast-notification "emacs.nodeModified" snapshot))
+          (org-writenotes--broadcast-to-node-peers
+           "emacs.nodeModified" snapshot (plist-get snapshot :nodeId)))
         (message "[Org-WriteNotes] Node flagged for flashcard review (:%s:)."
                  org-writenotes-drill-tag)))))
 
@@ -414,7 +441,8 @@ A link is repaired when exactly one file with the same basename exists."
         (org-set-property "DRILL_CARD_TYPE" "simple")
         (save-buffer)
         (let ((snapshot (org-writenotes--parse-subtree-at-point)))
-          (org-writenotes--broadcast-notification "emacs.nodeModified" snapshot)
+          (org-writenotes--broadcast-to-node-peers
+           "emacs.nodeModified" snapshot (plist-get snapshot :nodeId))
           `(:success t :nodeId ,node-id :tag ,org-writenotes-drill-tag))))))
 
 ;;; C5: Inline preview cache keyed by file mtime ----------------------------
@@ -459,9 +487,15 @@ advising `org-writenotes--create-image-svgz-advice' or `create-image'."
                       (append props (list :max-width org-writenotes-inline-max-width))
                     props)))
             (if (and cached-xml (stringp cached-xml) (> (length cached-xml) 0))
-                (let ((adapted (or (ignore-errors (org-writenotes--adapt-svg-xml-for-theme cached-xml))
-                                   cached-xml)))
-                  (apply orig-fun adapted 'svg t final-props))
+                (let* ((adapted (or (ignore-errors (org-writenotes--adapt-svg-xml-for-theme cached-xml))
+                                    cached-xml))
+                       (scaled (if (fboundp 'org-writenotes--compensate-nonscaling-strokes)
+                                   (org-writenotes--compensate-nonscaling-strokes
+                                    adapted
+                                    (org-writenotes--inline-scale
+                                     (org-writenotes--svg-native-width cached-xml) final-props))
+                                 adapted)))
+                  (apply orig-fun scaled 'svg t final-props))
               (let ((img (apply orig-fun file-or-data type data-p props)))
                 (when (and (not data-p) (file-exists-p abs-file))
                   (let ((pair (ignore-errors (org-writenotes--read-and-repair-svgz abs-file))))
@@ -547,6 +581,7 @@ advising `org-writenotes--create-image-svgz-advice' or `create-image'."
       ["Org-WriteNotes"
        ["Tablet & Companion"
         ("p" "Push node" org-writenotes-push-node)
+        ("c" "Connected clients & status" org-writenotes-status)
         ("q" "Pair via LAN QR" org-writenotes-pair-qr)
         ("t" "Pair via Tailscale" org-writenotes-pair-tailscale)
         ("d" "Connect Linux desktop" org-writenotes-connect-linux)
@@ -562,7 +597,8 @@ advising `org-writenotes--create-image-svgz-advice' or `create-image'."
     (interactive)
     (call-interactively
      (intern (completing-read "Org-WriteNotes: "
-                              '("org-writenotes-push-node" "org-writenotes-pair-qr"
+                              '("org-writenotes-push-node" "org-writenotes-status"
+                                "org-writenotes-pair-qr"
                                 "org-writenotes-connect-linux" "org-writenotes-connect-ipad"
                                 "org-writenotes-popup-sketch-at-point"
                                 "org-writenotes-revert-sketch-at-point"
@@ -601,18 +637,23 @@ PROC is the client process and MSG-TEXT the raw JSON-RPC message."
          (method (alist-get 'method req))
          (params (alist-get 'params req))
          (node (and (listp params) (alist-get 'nodeId params)))
-         (fails (or (process-get proc 'auth-failures) 0))
-         (result (funcall orig proc msg-text)))
-    (when (stringp node)
+         (prev-node (and (processp proc) (process-get proc 'active-node)))
+         (fails (or (process-get proc 'auth-failures) 0)))
+    (when (and (stringp node) (processp proc) (process-get proc :authed))
       (process-put proc 'active-node node))
-    (when (and (equal method "session.hello")
-               (= fails (or (process-get proc 'auth-failures) 0))
-               (process-live-p proc))
-      (process-put proc 'client-name (alist-get 'clientName params))
-      (process-put proc 'presence-ok t))
-    (when (or (equal method "session.hello") (stringp node))
-      (org-writenotes--broadcast-presence))
-    result))
+    (let ((result (funcall orig proc msg-text)))
+      (when (stringp node)
+        (process-put proc 'active-node node))
+      (when (and (equal method "session.hello")
+                 (= fails (or (process-get proc 'auth-failures) 0))
+                 (process-live-p proc))
+        (process-put proc 'client-name (alist-get 'clientName params))
+        (process-put proc 'presence-ok t))
+      (when (or (equal method "session.hello")
+                (not (equal prev-node (and (processp proc)
+                                           (process-get proc 'active-node)))))
+        (org-writenotes--broadcast-presence))
+      result)))
 
 (advice-add 'org-writenotes--dispatch-rpc :around #'org-writenotes--presence-around)
 
@@ -623,6 +664,93 @@ PROC is the client process and MSG-TEXT the raw JSON-RPC message."
     (run-at-time 0 nil #'org-writenotes--broadcast-presence)))
 
 (advice-add 'org-writenotes--client-sentinel :after #'org-writenotes--presence-sentinel)
+
+(defun org-writenotes--render-status-buffer (&optional _ignore-auto _noconfirm)
+  "Populate the current buffer with Org-WriteNotes server and client sync status."
+  (setq org-writenotes--clients
+        (cl-remove-if-not #'process-live-p org-writenotes--clients))
+  (let ((inhibit-read-only t)
+        (server-live (and org-writenotes--server-proc
+                          (process-live-p org-writenotes--server-proc))))
+    (erase-buffer)
+    (insert "=== Org-WriteNotes Server & Multi-Client Sync Status ===\n\n")
+    (insert (format "Server Status   : %s\n"
+                    (if server-live
+                        (format "RUNNING on ws://%s:%d (protocol v%d)"
+                                (or org-writenotes--bound-host org-writenotes-host)
+                                org-writenotes-port
+                                org-writenotes-protocol-version)
+                      "STOPPED")))
+    (insert (format "Follow Mode     : %s\n"
+                    (if org-writenotes-follow-mode "ENABLED" "disabled")))
+    (insert (format "Emacs Focus Node: %s\n"
+                    (or org-writenotes--active-node-id "(none)")))
+    (insert (format "Connected Peers : %d\n\n" (length org-writenotes--clients)))
+    (if (null org-writenotes--clients)
+        (insert "No clients currently connected.\n")
+      (let ((idx 0))
+        (dolist (proc org-writenotes--clients)
+          (cl-incf idx)
+          (let* ((name (or (process-get proc 'client-name) "client"))
+                 (contact (ignore-errors (process-contact proc)))
+                 (addr (if (and (listp contact) (>= (length contact) 2))
+                           (format "%s:%s" (nth 0 contact) (nth 1 contact))
+                         (process-name proc)))
+                 (authed (if (process-get proc :authed) "authenticated" "unauthenticated"))
+                 (proto (or (process-get proc 'client-protocol) 1))
+                 (nid (or (process-get proc 'active-node)
+                          org-writenotes--active-node-id))
+                 (loc (and (stringp nid) (org-writenotes--locate-node nid)))
+                 (title (when loc
+                          (with-current-buffer (car loc)
+                            (save-excursion
+                              (goto-char (cdr loc))
+                              (ignore-errors
+                                (org-back-to-heading t)
+                                (org-get-heading t t t t))))))
+                 (etag (and (stringp nid)
+                            (or (gethash nid org-writenotes--node-etags)
+                                (and (equal nid org-writenotes--active-node-id)
+                                     org-writenotes--last-active-etag))))
+                 (peers (and (stringp nid)
+                             (length (org-writenotes--peers-for-node nid proc)))))
+            (insert (format "%d. %s  [%s] (%s, protocol v%s)\n"
+                            idx name addr authed proto))
+            (insert "   Active Node : ")
+            (if (stringp nid)
+                (if loc
+                    (insert-text-button
+                     (if title (format "%s  (%s)" title nid) nid)
+                     'action (lambda (_)
+                               (when-let* ((l (org-writenotes--locate-node nid)))
+                                 (pop-to-buffer (car l))
+                                 (goto-char (cdr l)))))
+                  (insert nid " (unlocated)"))
+              (insert "(none)"))
+            (insert "\n")
+            (insert (format "   Sync Status : %s%s\n\n"
+                            (if etag (format "synced (%s)" etag) "ready")
+                            (if (and peers (> peers 0))
+                                (format ", co-viewing with %d other client(s)" peers)
+                              "")))))))
+    (insert "Press `g' to refresh, `q' to quit.\n")))
+
+;;;###autoload
+(defun org-writenotes-status ()
+  "Display connected clients and their current Org node sync status."
+  (interactive)
+  (let ((buf (get-buffer-create "*Org-WriteNotes Status*")))
+    (with-current-buffer buf
+      (special-mode)
+      (setq-local revert-buffer-function #'org-writenotes--render-status-buffer)
+      (org-writenotes--render-status-buffer))
+    (pop-to-buffer buf)
+    (org-writenotes--presence-list)))
+
+;;;###autoload
+(defalias 'org-writenotes-list-clients #'org-writenotes-status)
+
+(define-key org-writenotes-command-map (kbd "c") #'org-writenotes-status)
 
 ;;; C2: Multi-file node routing ----------------------------------------------------
 
@@ -788,7 +916,9 @@ When the popup saves or exits, the inline `.svgz' image in Emacs is refreshed."
          (lambda (_p _ev)
            (when (file-exists-p path)
              (remhash path org-writenotes--live-svg-cache)
-             (org-writenotes--refresh-inline-image path))))
+             (org-writenotes--refresh-inline-image path)
+             (unless (string-empty-p node-id)
+               (org-writenotes--notify-node-peers node-id)))))
         (message "[Org-WriteNotes] Opened %s in Linux sketch popup."
                  (file-name-nondirectory path))
         proc))))

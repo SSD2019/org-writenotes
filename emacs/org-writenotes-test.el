@@ -146,21 +146,49 @@
                              "<path stroke=\"#000000\" d=\"M0 0 L10 10\"/>\n"
                              "<path fill=\"#1E293B\" d=\"M20 20 L30 30\"/>\n"
                              "</svg>"))
+         (svg-white-paper (concat "<svg id=\"write-document\">\n"
+                                  "<rect id=\"write-doc-background\" width=\"100%\" height=\"100%\" fill=\"#808080\"/>\n"
+                                  "<g class=\"write-content\" papercolor=\"#FFFFFF\">\n"
+                                  "<rect class=\"pagerect\" fill=\"#FFFFFF\" stroke=\"none\" x=\"0\" y=\"0\" width=\"1440\" height=\"1728\" />\n"
+                                  "<path class=\"write-round-pen\" fill=\"#000000\" d=\"M0 0 L10 10\"/>\n"
+                                  "<path class=\"write-flat-pen\" fill=\"#FFFFFF\" d=\"M20 20 L30 30\"/>\n"
+                                  "</g></svg>"))
+         (svg-dark-paper (concat "<svg id=\"write-document\">\n"
+                                 "<rect id=\"write-doc-background\" width=\"100%\" height=\"100%\" fill=\"#808080\"/>\n"
+                                 "<g class=\"write-content\" papercolor=\"#000000\">\n"
+                                 "<rect class=\"pagerect\" fill=\"#000000\" stroke=\"none\" x=\"0\" y=\"0\" width=\"1440\" height=\"1728\" />\n"
+                                 "<path class=\"write-round-pen\" fill=\"#000000\" d=\"M0 0 L10 10\"/>\n"
+                                 "</g></svg>"))
          (replaced (org-writenotes--replace-pagerect-fill svg-sample "#292b2e")))
     ;; Must not have nested/corrupted rect tags like <rect <rect ...
     (should-not (string-match-p "<rect[^>]*<rect" replaced))
     (should (string-match-p "<rect id=\"write-doc-background\" width=\"100%\" height=\"100%\" fill=\"#292b2e\"/>" replaced))
     (should (string-match-p "<rect class=\"pagerect\" fill=\"#292b2e\" stroke=\"none\" x=\"0\" y=\"0\" width=\"1200\" height=\"600\" />" replaced))
     ;; Light -> Dark -> Light adaptation check
-    (cl-letf (((symbol-function 'org-writenotes--emacs-is-dark-p) (lambda () nil)))
-      (let ((light-adapted (org-writenotes--adapt-svg-xml-for-theme svg-sample)))
+    (cl-letf (((symbol-function 'org-writenotes--emacs-is-dark-p) (lambda () nil))
+              ((symbol-function 'face-background) (lambda (&rest _) "#ffffff"))
+              ((symbol-function 'face-foreground) (lambda (&rest _) "#5f5f87")))
+      (let ((light-adapted (org-writenotes--adapt-svg-xml-for-theme svg-sample))
+            (white-light-adapted (org-writenotes--adapt-svg-xml-for-theme svg-white-paper)))
         (should (stringp light-adapted))
-        (should-not (string-match-p "<rect[^>]*<rect" light-adapted))))
-    (cl-letf (((symbol-function 'org-writenotes--emacs-is-dark-p) (lambda () t)))
-      (let ((dark-adapted (org-writenotes--adapt-svg-xml-for-theme svg-sample)))
+        (should-not (string-match-p "<rect[^>]*<rect" light-adapted))
+        ;; Pure-white paper in light theme must keep #FFFFFF on .pagerect and #write-doc-background,
+        ;; while adapting white pen strokes to frame-fg (#5F5F87).
+        (should (string-match-p "<rect id=\"write-doc-background\" width=\"100%\" height=\"100%\" fill=\"#FFFFFF\"/>" white-light-adapted))
+        (should (string-match-p "<rect class=\"pagerect\" fill=\"#FFFFFF\"" white-light-adapted))
+        (should (string-match-p "<path class=\"write-round-pen\" fill=\"#000000\"" white-light-adapted))
+        (should (string-match-p "<path class=\"write-flat-pen\" fill=\"#5F5F87\"" white-light-adapted))))
+    (cl-letf (((symbol-function 'org-writenotes--emacs-is-dark-p) (lambda () t))
+              ((symbol-function 'face-background) (lambda (&rest _) "#292b2e"))
+              ((symbol-function 'face-foreground) (lambda (&rest _) "#b2b2b2")))
+      (let ((dark-adapted (org-writenotes--adapt-svg-xml-for-theme svg-sample))
+            (dark-paper-adapted (org-writenotes--adapt-svg-xml-for-theme svg-dark-paper)))
         (should (stringp dark-adapted))
         (should-not (string-match-p "<rect[^>]*<rect" dark-adapted))
-        (should-not (string-match-p "fill=\"#FFFDF8\"" dark-adapted))))))
+        (should-not (string-match-p "fill=\"#FFFDF8\"" dark-adapted))
+        ;; Dark paper in dark theme must keep dark #000000 on .pagerect, while strokes adapt to #B2B2B2.
+        (should (string-match-p "<rect class=\"pagerect\" fill=\"#000000\"" dark-paper-adapted))
+        (should (string-match-p "<path class=\"write-round-pen\" fill=\"#B2B2B2\"" dark-paper-adapted))))))
 
 ;; Agenda must return only what Emacs' own day agenda shows, not every TODO.
 (ert-deftest org-writenotes-test-agenda-only-today ()

@@ -283,3 +283,153 @@
         (should (equal generated
                        "orgwritenotes://connect?host=100.88.1.9&port=9876&token=secret-ipad-tok"))))))
 
+(ert-deftest org-writenotes-extras-broadcast-frame-cache ()
+  "Broadcasting to N clients serializes and frames the JSON payload only once."
+  (let* ((c1 (make-pipe-process :name "wn-c1" :noquery t))
+         (c2 (make-pipe-process :name "wn-c2" :noquery t))
+         (c3 (make-pipe-process :name "wn-c3" :noquery t))
+         (org-writenotes--clients (list c1 c2 c3))
+         (org-writenotes--ws-frame-cache nil)
+         (encode-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'org-writenotes--ws-encode-frame)
+                   (lambda (s) (cl-incf encode-calls) (concat "FRAME:" s))))
+          (org-writenotes--broadcast-notification "emacs.themeChanged" '(:isDark t))
+          (should (= encode-calls 1))
+          (should (consp org-writenotes--ws-frame-cache)))
+      (delete-process c1)
+      (delete-process c2)
+      (delete-process c3))))
+
+(ert-deftest org-writenotes-extras-multi-client-sync ()
+  "Multiple clients on the same node sync mutations, strokes, and commits without echoing or disturbing clients on other nodes."
+  (org-writenotes-test--with-dir d
+    (let* ((org-file (expand-file-name "multi.org" d))
+           (svgz-file (expand-file-name "writenotes/s1.svgz" d))
+           (client-a (make-pipe-process :name "wn-mc-a" :noquery t))
+           (client-b (make-pipe-process :name "wn-mc-b" :noquery t))
+           (client-c (make-pipe-process :name "wn-mc-c" :noquery t))
+           (org-writenotes--clients (list client-a client-b client-c))
+           (sent nil)
+           node-1 node-2)
+      (unwind-protect
+          (progn
+            (make-directory (file-name-directory svgz-file) t)
+            (org-writenotes--create-blank-svgz svgz-file 1200 600 40 40)
+            (with-current-buffer (find-file-noselect org-file)
+              (org-mode)
+              (insert "* Node One\n"
+                      ":PROPERTIES:\n:ID: mc-node-1\n:END:\n"
+                      "- [ ] Check item\n"
+                      "[[file:./writenotes/s1.svgz]]\n"
+                      "* Node Two\n"
+                      ":PROPERTIES:\n:ID: mc-node-2\n:END:\n"
+                      "Initial paragraph on node two.\n")
+              (basic-save-buffer)
+              (setq node-1 (format "file:%s::id:mc-node-1" org-file)
+                    node-2 (format "file:%s::id:mc-node-2" org-file)
+                    org-writenotes--active-node-id node-1)
+              (dolist (c (list client-a client-b client-c))
+                (process-put c :authed t)
+                (process-put c 'presence-ok t))
+              (process-put client-a 'active-node node-1)
+              (process-put client-b 'active-node node-1)
+              (process-put client-c 'active-node node-2)
+              (setq org-writenotes--last-presence (org-writenotes--presence-list))
+              (cl-letf (((symbol-function 'org-writenotes--ws-send-json)
+                         (lambda (proc payload)
+                           (push (cons proc payload) sent)))
+                        ((symbol-function 'org-writenotes--refresh-inline-image) #'ignore))
+                ;; 1. Client A toggles checkbox on Node 1 -> A gets RPC result, B gets nodeModified, C gets nothing.
+                (setq sent nil)
+                (org-writenotes--dispatch-rpc
+                 client-a
+                 (json-serialize
+                  `(:jsonrpc "2.0" :id 10 :method "node.toggleCheckbox"
+                    :params (:nodeId ,node-1 :line 5 :state "checked"))))
+                (let ((a-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-a)) sent))
+                      (b-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-b)) sent))
+                      (c-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-c)) sent)))
+                  (should (= (length a-msgs) 1))
+                  (should (equal (plist-get (cdr (car a-msgs)) :id) 10))
+                  (should (= (length b-msgs) 1))
+                  (should (equal (plist-get (cdr (car b-msgs)) :method) "emacs.nodeModified"))
+                  (should (null c-msgs)))
+
+                ;; 2. Client A sends ink.delta on Node 1 -> B gets relayed ink.delta, A and C do not.
+                (setq sent nil)
+                (org-writenotes--dispatch-rpc
+                 client-a
+                 (json-serialize
+                  `(:jsonrpc "2.0" :id 11 :method "ink.delta"
+                    :params (:nodeId ,node-1 :fileName "s1.svgz" :strokeId "st-1"
+                             :pathXml "<path id=\"st-1\" d=\"M 0 0 L 10 10\"/>"))))
+                (let ((b-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-b)) sent))
+                      (c-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-c)) sent)))
+                  (should (= (length b-msgs) 1))
+                  (should (equal (plist-get (cdr (car b-msgs)) :method) "ink.delta"))
+                  (should (equal (plist-get (plist-get (cdr (car b-msgs)) :params) :strokeId) "st-1"))
+                  (should (null c-msgs)))
+
+                ;; 3. Client A commits new .svgz bytes on Node 1 -> B gets emacs.nodeModified with updated svgzBase64 & etag.
+                (setq sent nil)
+                (let ((new-b64 (base64-encode-string "updated-svgz-binary" t))
+                      (expected-etag (secure-hash 'sha1 "updated-svgz-binary")))
+                  (org-writenotes--dispatch-rpc
+                   client-a
+                   (json-serialize
+                    `(:jsonrpc "2.0" :id 12 :method "ink.commit"
+                      :params (:nodeId ,node-1 :fileName "s1.svgz" :svgzBase64 ,new-b64))))
+                  (let* ((b-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-b)) sent))
+                         (c-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-c)) sent))
+                         (b-snap (plist-get (cdr (car b-msgs)) :params))
+                         (b-blocks (append (plist-get b-snap :blocks) nil))
+                         (ink-blk (cl-find-if (lambda (b) (equal (plist-get b :type) "ink_canvas")) b-blocks)))
+                    (should (= (length b-msgs) 1))
+                    (should (equal (plist-get (cdr (car b-msgs)) :method) "emacs.nodeModified"))
+                    (should (equal (plist-get ink-blk :svgzBase64) new-b64))
+                    (should (equal (plist-get ink-blk :etag) expected-etag))
+                    (should (null c-msgs)))
+
+                  ;; 3b. Client B commits on top of the pushed sketch -> succeeds without conflict and notifies Client A.
+                  (setq sent nil)
+                  (let ((b2-b64 (base64-encode-string "updated-svgz-from-b" t)))
+                    (org-writenotes--dispatch-rpc
+                     client-b
+                     (json-serialize
+                      `(:jsonrpc "2.0" :id 13 :method "ink.commit"
+                        :params (:nodeId ,node-1 :fileName "s1.svgz"
+                                 :baseEtag "stale-etag-before-push"
+                                 :svgzBase64 ,b2-b64))))
+                    (let* ((b-resp (cdr (cl-find-if (lambda (x) (and (eq (car x) client-b)
+                                                                     (plist-get (cdr x) :id)))
+                                                    sent)))
+                           (a-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-a)) sent)))
+                      (should-not (plist-get (plist-get b-resp :result) :conflict))
+                      (should (= (length a-msgs) 1))
+                      (should (equal (plist-get (cdr (car a-msgs)) :method) "emacs.nodeModified")))))
+
+                ;; 4. Direct Emacs edit in Node 2 pushes emacs.nodeModified to Client C (watching Node 2) only.
+                (goto-char (point-min))
+                (search-forward "* Node Two")
+                (org-writenotes--parse-subtree-at-point t)
+                (goto-char (point-max))
+                (insert "Added line in Emacs for Node Two.\n")
+                (setq sent nil)
+                (setq org-writenotes--changed-buffers (list (current-buffer)))
+                (org-writenotes--change-debounce-tick)
+                (let ((a-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-a)) sent))
+                      (b-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-b)) sent))
+                      (c-msgs (cl-remove-if-not (lambda (x) (eq (car x) client-c)) sent)))
+                  (should (null a-msgs))
+                  (should (null b-msgs))
+                  (should (= (length c-msgs) 1))
+                  (should (equal (plist-get (cdr (car c-msgs)) :method) "emacs.nodeModified"))
+                  (should (equal (plist-get (plist-get (cdr (car c-msgs)) :params) :nodeId) node-2))))
+              (set-buffer-modified-p nil)
+              (kill-buffer)))
+        (delete-process client-a)
+        (delete-process client-b)
+        (delete-process client-c)))))
+
+

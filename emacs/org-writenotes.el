@@ -98,6 +98,18 @@ All nodes share this directory so per-node subdirectories are not required."
 (defvar org-writenotes--rpc-json-cache nil
   "Last `(TEXT . PARSED)' pair from `org-writenotes--read-rpc-json'.")
 
+(defvar org-writenotes--ws-frame-cache nil
+  "Last `(PAYLOAD-PLIST . FRAME)' pair from `org-writenotes--ws-send-json'.")
+
+(defvar org-writenotes--in-rpc-client nil
+  "Client process currently executing a JSON-RPC request, or nil.")
+
+(defvar org-writenotes--node-etags (make-hash-table :test 'equal)
+  "Maps node ID strings to their most recently parsed `:etag' value.")
+
+(defvar org-writenotes--changed-buffers nil
+  "List of Org buffers modified since the last debounce broadcast tick.")
+
 (defvar org-writenotes--decoded-b64 nil
   "Optional `(B64 . BYTES)' pair so `ink.commit' decodes its payload once.")
 
@@ -211,6 +223,15 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
 (defvar org-writenotes--last-theme-is-dark nil
   "Last known background mode of Emacs (t for dark, nil for light).")
 
+(defvar org-writenotes--last-theme-payload nil
+  "Last applied theme payload plist.")
+
+(defvar org-writenotes--theme-change-timer nil
+  "Idle timer for coalescing rapid theme-change hook invocations.")
+
+(defvar-local org-writenotes--buffer-theme-payload nil
+  "Theme payload under which this buffer's inline images were last rendered.")
+
 (defvar org-writenotes--last-active-etag nil
   "Last broadcast `:etag' of `org-writenotes--active-node-id'.")
 
@@ -262,13 +283,20 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
           fallback)))
      (t fallback))))
 
+(defun org-writenotes--gui-frame ()
+  "Return an active graphic frame if one exists (for `emacs --daemon'), or nil."
+  (if (display-graphic-p (selected-frame))
+      (selected-frame)
+    (cl-find-if #'display-graphic-p (frame-list))))
+
 (defun org-writenotes--emacs-is-dark-p ()
   "Return t if the current Emacs frame has a dark background."
-  (let ((bg-hex (org-writenotes--normalize-hex-color
-                 (face-background 'default nil t) nil)))
+  (let* ((frame (org-writenotes--gui-frame))
+         (bg-hex (org-writenotes--normalize-hex-color
+                  (face-background 'default frame t) nil)))
     (if bg-hex
         (org-writenotes--hex-color-dark-p bg-hex)
-      (eq (frame-parameter nil 'background-mode) 'dark))))
+      (eq (frame-parameter frame 'background-mode) 'dark))))
 
 (defun org-writenotes--replace-pagerect-fill (svg-xml new-fill)
   "Replace the `fill' attribute on `.pagebg', `.pagerect', `.write-background', and `#write-doc-background' `<rect>' tags in SVG-XML with NEW-FILL."
@@ -284,22 +312,23 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
 
 (defun org-writenotes--current-theme-payload ()
   "Return a plist describing the active Emacs color theme."
-  (let* ((dark-p (org-writenotes--emacs-is-dark-p))
+  (let* ((frame (org-writenotes--gui-frame))
+         (dark-p (org-writenotes--emacs-is-dark-p))
          (raw-bg (org-writenotes--normalize-hex-color
-                  (face-background 'default nil t)
+                  (face-background 'default frame t)
                   (if dark-p "#1E293B" "#FFFDF8")))
          (bg (if dark-p
                  (if (org-writenotes--hex-color-dark-p raw-bg) raw-bg "#1E293B")
                (if (org-writenotes--hex-color-dark-p raw-bg) "#FFFDF8" raw-bg)))
          (raw-fg (org-writenotes--normalize-hex-color
-                  (face-foreground 'default nil t)
+                  (face-foreground 'default frame t)
                   (if dark-p "#F8FAFC" "#1E293B")))
          (fg (if dark-p
                  (if (org-writenotes--hex-color-dark-p raw-fg) "#F8FAFC" raw-fg)
                (if (org-writenotes--hex-color-dark-p raw-fg) raw-fg "#1E293B")))
          (accent (org-writenotes--normalize-hex-color
-                  (or (face-foreground 'font-lock-keyword-face nil t)
-                      (face-foreground 'font-lock-function-name-face nil t))
+                  (or (face-foreground 'font-lock-keyword-face frame t)
+                      (face-foreground 'font-lock-function-name-face frame t))
                   "#38BDF8")))
     `(:isDark ,(if dark-p t :false)
       :bgColor ,bg
@@ -315,15 +344,16 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
       (if (or (not (stringp clean-xml))
               (eq org-writenotes-inline-theme 'paper))
           clean-xml
-        (let* ((dark-p (org-writenotes--emacs-is-dark-p))
+        (let* ((frame (org-writenotes--gui-frame))
+               (dark-p (org-writenotes--emacs-is-dark-p))
                (raw-bg (org-writenotes--normalize-hex-color
-                        (face-background 'default nil t)
+                        (face-background 'default frame t)
                         (if dark-p "#1E293B" "#FFFDF8")))
                (frame-bg (if dark-p
                              (if (org-writenotes--hex-color-dark-p raw-bg) raw-bg "#1E293B")
                            (if (org-writenotes--hex-color-dark-p raw-bg) "#FFFDF8" raw-bg)))
                (raw-fg (org-writenotes--normalize-hex-color
-                        (face-foreground 'default nil t)
+                        (face-foreground 'default frame t)
                         (if dark-p "#F8FAFC" "#1E293B")))
                (frame-fg (if dark-p
                              (if (org-writenotes--hex-color-dark-p raw-fg) "#F8FAFC" raw-fg)
@@ -350,11 +380,12 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
                                  "stroke=\"#\\(?:4[aA]90[eE]2\\|0000[fF][fF]\\)\""
                                  "stroke=\"#334155\"" adapted t t)))
               (setq adapted (replace-regexp-in-string
-                             "fill=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\)\\|white\\)\""
+                             "fill=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\|[bB]2[bB]2[bB]2\\)\\|white\\)\""
                              (format "fill=\"%s\"" frame-fg) adapted t t))
               (setq adapted (replace-regexp-in-string
-                             "stroke=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\)\\|white\\)\""
-                             (format "stroke=\"%s\"" frame-fg) adapted t t))))
+                             "stroke=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\|[bB]2[bB]2[bB]2\\)\\|white\\)\""
+                             (format "stroke=\"%s\"" frame-fg) adapted t t))
+              (setq adapted (org-writenotes--replace-pagerect-fill adapted "none"))))
 
            ((and (eq org-writenotes-inline-theme 'auto) dark-p)
             ;; 1. First adapt standard black/dark strokes to light frame foreground
@@ -365,9 +396,11 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
             (setq adapted (replace-regexp-in-string
                            "stroke=\"\\(?:#\\(?:1[eE]293[bB]\\|000000\\|000\\)\\|black\\)\""
                            (format "stroke=\"%s\"" frame-fg) adapted t t))
-            ;; 2. Adapt any light page background rect (.pagebg / .pagerect) to Emacs frame-bg
+            ;; 2. Always restore page background rects (.pagebg / .pagerect / #write-doc-background)
+            ;;    so neither light paper nor dark .pagerect (fill="#000000") stays clobbered with frame-fg
+            (setq adapted (org-writenotes--replace-pagerect-fill
+                           adapted (if page-is-dark paper-color frame-bg)))
             (unless page-is-dark
-              (setq adapted (org-writenotes--replace-pagerect-fill adapted frame-bg))
               (setq adapted (replace-regexp-in-string
                              "papercolor=\"#[0-9A-Fa-f]+\""
                              (format "papercolor=\"%s\"" frame-bg) adapted t t))
@@ -380,38 +413,46 @@ TrOCR-compatible Hugging Face id or local path.  A model is downloaded on first 
                              "rulecolor=\"#33415544\"" adapted t t))))
 
            ((and (eq org-writenotes-inline-theme 'auto) (not dark-p))
-            ;; In light mode, ensure white/light-foreground strokes remain visible on light paper
-            (if page-is-dark
-                (progn
-                  (setq adapted (replace-regexp-in-string
-                                 "fill=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\)\\|white\\)\""
-                                 (format "fill=\"%s\"" frame-fg) adapted t t))
-                  (setq adapted (replace-regexp-in-string
-                                 "stroke=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\)\\|white\\)\""
-                                 (format "stroke=\"%s\"" frame-fg) adapted t t))
-                  (setq adapted (org-writenotes--replace-pagerect-fill adapted frame-bg))
-                  (setq adapted (replace-regexp-in-string
-                                 "papercolor=\"#[0-9A-Fa-f]+\""
-                                 (format "papercolor=\"%s\"" frame-bg) adapted t t)))
+            ;; In light mode, ensure white/light-foreground strokes remain visible on light paper,
+            ;; then always restore .pagerect / .pagebg / #write-doc-background so fill="#FFFFFF"
+            ;; on the page background rect is never left replaced with frame-fg.
+            (setq adapted (replace-regexp-in-string
+                           "fill=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\|[bB]2[bB]2[bB]2\\)\\|white\\)\""
+                           (format "fill=\"%s\"" frame-fg) adapted t t))
+            (setq adapted (replace-regexp-in-string
+                           "stroke=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\|[bB]2[bB]2[bB]2\\)\\|white\\)\""
+                           (format "stroke=\"%s\"" frame-fg) adapted t t))
+            (setq adapted (org-writenotes--replace-pagerect-fill
+                           adapted (if page-is-dark frame-bg paper-color)))
+            (when page-is-dark
               (setq adapted (replace-regexp-in-string
-                             "fill=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\)\\|white\\)\""
-                             (format "fill=\"%s\"" frame-fg) adapted t t))
-              (setq adapted (replace-regexp-in-string
-                             "stroke=\"\\(?:#\\(?:[fF]\\{6\\}\\|[fF]\\{3\\}\\|[fF]8[fF][aA][fF][cC]\\|[cC][dD][dD]6[fF]4\\)\\|white\\)\""
-                             (format "stroke=\"%s\"" frame-fg) adapted t t)))))
+                             "papercolor=\"#[0-9A-Fa-f]+\""
+                             (format "papercolor=\"%s\"" frame-bg) adapted t t)))))
           adapted)))))
 
+(defun org-writenotes--apply-theme-change (&optional force)
+  "Apply the current Emacs theme to visible inline sketches and notify tablets.
+When FORCE is nil, skips redundant refreshes if the theme payload has not changed."
+  (setq org-writenotes--theme-change-timer nil)
+  (let* ((payload (org-writenotes--current-theme-payload))
+         (current-dark (eq (plist-get payload :isDark) t)))
+    (when (or force (not (equal payload org-writenotes--last-theme-payload)))
+      (setq org-writenotes--last-theme-is-dark current-dark
+            org-writenotes--last-theme-payload payload)
+      (org-writenotes--refresh-inline-image)
+      (when org-writenotes--clients
+        (org-writenotes--broadcast-notification
+         "emacs.themeChanged"
+         payload)))))
+
 (defun org-writenotes-notify-theme-changed (&rest _)
-  "Broadcast an `emacs.themeChanged' notification to connected tablets."
-  (when (fboundp 'frame-set-background-mode)
-    (ignore-errors (frame-set-background-mode (selected-frame))))
-  (let ((current-dark (org-writenotes--emacs-is-dark-p)))
-    (setq org-writenotes--last-theme-is-dark current-dark)
-    (org-writenotes--refresh-inline-image)
-    (when org-writenotes--clients
-      (org-writenotes--broadcast-notification
-       "emacs.themeChanged"
-       (org-writenotes--current-theme-payload)))))
+  "Coalesce theme-change hooks and broadcast `emacs.themeChanged' to tablets."
+  (if noninteractive
+      (org-writenotes--apply-theme-change t)
+    (when (timerp org-writenotes--theme-change-timer)
+      (cancel-timer org-writenotes--theme-change-timer))
+    (setq org-writenotes--theme-change-timer
+          (run-with-idle-timer 0 nil #'org-writenotes--apply-theme-change))))
 
 (defun org-writenotes--extract-svg-meta (svg-xml)
   "Extract width, height, xRuling, yRuling from SVG-XML string.
@@ -473,6 +514,7 @@ Set to nil to disable periodic ADB tunnel maintenance."
 
 (defun org-writenotes--write-raw-bytes (filepath raw-bytes)
   "Write unibyte RAW-BYTES directly to FILEPATH, bypassing `jka-compr' auto-compression."
+  (remhash (expand-file-name filepath) org-writenotes--svgz-cache)
   (let ((file-name-handler-alist nil)
         (coding-system-for-write 'no-conversion)
         (write-region-inhibit-fsync t))
@@ -667,16 +709,38 @@ PROPS are the `create-image' arguments.  Colors adapt to the theme and
                     (org-writenotes--write-raw-bytes unpacked-svg svg-xml)
                     (replace-match (format "[[file:%s]]" (file-relative-name unpacked-svg default-directory)) t t)))))))))))
 
+(defun org-writenotes--refresh-stale-window-buffers (&optional _)
+  "Refresh inline images in newly visible Org buffers whose theme payload is stale."
+  (when org-writenotes--last-theme-payload
+    (dolist (win (window-list nil 'no-minibuf))
+      (let ((buf (window-buffer win)))
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (when (and (derived-mode-p 'org-mode)
+                       (bound-and-true-p org-inline-image-overlays)
+                       (not (equal org-writenotes--buffer-theme-payload
+                                   org-writenotes--last-theme-payload)))
+              (setq org-writenotes--buffer-theme-payload
+                    org-writenotes--last-theme-payload)
+              (ignore-errors (org-display-inline-images t t)))))))))
+
 (defun org-writenotes--register-theme-hooks ()
   "Register theme-change hooks and advices so inline `.svgz' previews stay in sync."
-  (when (boundp 'enable-theme-functions)
-    (add-hook 'enable-theme-functions #'org-writenotes-notify-theme-changed))
-  (when (boundp 'disable-theme-functions)
-    (add-hook 'disable-theme-functions #'org-writenotes-notify-theme-changed))
-  (when (boundp 'after-load-theme-hook)
-    (add-hook 'after-load-theme-hook #'org-writenotes-notify-theme-changed))
-  (advice-add 'load-theme :after #'org-writenotes-notify-theme-changed)
-  (advice-add 'disable-theme :after #'org-writenotes-notify-theme-changed))
+  (if (and (boundp 'enable-theme-functions)
+           (boundp 'disable-theme-functions))
+      (progn
+        (add-hook 'enable-theme-functions #'org-writenotes-notify-theme-changed)
+        (add-hook 'disable-theme-functions #'org-writenotes-notify-theme-changed)
+        (advice-remove 'load-theme #'org-writenotes-notify-theme-changed)
+        (advice-remove 'enable-theme #'org-writenotes-notify-theme-changed)
+        (advice-remove 'disable-theme #'org-writenotes-notify-theme-changed))
+    (when (boundp 'after-load-theme-hook)
+      (add-hook 'after-load-theme-hook #'org-writenotes-notify-theme-changed))
+    (advice-add 'load-theme :after #'org-writenotes-notify-theme-changed)
+    (advice-add 'enable-theme :after #'org-writenotes-notify-theme-changed)
+    (advice-add 'disable-theme :after #'org-writenotes-notify-theme-changed))
+  (when (boundp 'window-buffer-change-functions)
+    (add-hook 'window-buffer-change-functions #'org-writenotes--refresh-stale-window-buffers)))
 
 ;;;###autoload
 (defun org-writenotes-enable-svgz-inline-images ()
@@ -696,10 +760,17 @@ PROPS are the `create-image' arguments.  Colors adapt to the theme and
   (when (boundp 'org-export-before-parsing-functions)
     (add-hook 'org-export-before-parsing-functions #'org-writenotes--org-export-unpack-svgz))
   (org-writenotes--register-theme-hooks)
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (when (and (derived-mode-p 'org-mode) (display-graphic-p))
-        (ignore-errors (org-display-inline-images t t)))))
+  (let ((gui-frame (org-writenotes--gui-frame))
+        (payload (org-writenotes--current-theme-payload)))
+    (setq org-writenotes--last-theme-payload payload)
+    (when gui-frame
+      (with-selected-frame gui-frame
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (when (and (derived-mode-p 'org-mode)
+                       (get-buffer-window buf 'visible))
+              (setq org-writenotes--buffer-theme-payload payload)
+              (ignore-errors (org-display-inline-images t t))))))))
   (when (called-interactively-p 'interactive)
     (message "[Org-WriteNotes] Enabled inline .svgz rendering.")))
 
@@ -708,18 +779,23 @@ PROPS are the `create-image' arguments.  Colors adapt to the theme and
 If SAVED-PATH is non-nil, only invalidate the cache for that specific file."
   (when (fboundp 'clear-image-cache)
     (ignore-errors (clear-image-cache)))
-  (when (boundp 'org-writenotes--mtime-image-cache)
-    (if saved-path
-        (remhash (expand-file-name saved-path) org-writenotes--mtime-image-cache)
-      (clrhash org-writenotes--mtime-image-cache)))
+  (when (and saved-path (boundp 'org-writenotes--mtime-image-cache))
+    (remhash (expand-file-name saved-path) org-writenotes--mtime-image-cache))
   (when (and saved-path (boundp 'org-writenotes--live-svg-cache))
     (remhash (expand-file-name saved-path) org-writenotes--live-svg-cache))
-  (dolist (buf (buffer-list))
-    (when (get-buffer-window buf 'visible)
-      (with-current-buffer buf
-        (when (derived-mode-p 'org-mode)
-          (ignore-errors (org-display-inline-images t t))))))
-  (redisplay))
+  (let ((gui-frame (or (org-writenotes--gui-frame) (selected-frame)))
+        (payload (or org-writenotes--last-theme-payload
+                     (org-writenotes--current-theme-payload))))
+    (with-selected-frame gui-frame
+      (dolist (buf (buffer-list))
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (when (and (derived-mode-p 'org-mode)
+                       (get-buffer-window buf 'visible))
+              (setq org-writenotes--buffer-theme-payload payload)
+              (ignore-errors (org-display-inline-images t t))))))))
+  (when saved-path
+    (redisplay)))
 
 (defun org-writenotes--resolve-image-dir (org-file)
   "Return the absolute directory path for storing `.svgz' files for ORG-FILE."
@@ -937,8 +1013,22 @@ When READ-ONLY is nil, ensures a stable `:ID:' is assigned if `org-writenotes-au
                       ht))
              (safe-end (min (point-max) (max beg end)))
              (subtree-text (buffer-substring-no-properties beg safe-end))
-             (etag (format "sha1-%s" (substring (sha1 subtree-text) 0 16)))
              (blocks (org-writenotes--extract-blocks beg body-end file))
+             (sketch-sig (mapconcat
+                          (lambda (blk)
+                            (if (string= (plist-get blk :type) "ink_canvas")
+                                (let ((et (plist-get blk :etag))
+                                      (b64 (plist-get blk :svgzBase64)))
+                                  (cond ((stringp et) et)
+                                        ((stringp b64) (sha1 b64))
+                                        (t "")))
+                              ""))
+                          blocks ""))
+             (etag (format "sha1-%s"
+                           (substring (sha1 (if (string-empty-p sketch-sig)
+                                                subtree-text
+                                              (concat subtree-text "\0" sketch-sig)))
+                                      0 16)))
              (subheadings (org-writenotes--extract-direct-subheadings beg end level))
              (check-total 0)
              (check-done 0))
@@ -974,6 +1064,8 @@ When READ-ONLY is nil, ensures a stable `:ID:' is assigned if `org-writenotes-au
                  :blocks ,(vconcat blocks)
                  :subheadings ,subheadings)))
           (setq org-writenotes--last-active-etag etag)
+          (when node-id
+            (puthash node-id etag org-writenotes--node-etags))
           (org-writenotes--record-pushed-node snapshot)
           snapshot)))))
 
@@ -1024,17 +1116,17 @@ When READ-ONLY is nil, ensures a stable `:ID:' is assigned if `org-writenotes-au
       (cons (file-attribute-modification-time attrs) (file-attribute-size attrs)))))
 
 (defun org-writenotes--svgz-cache-get (path)
-  "Return cached `(STAT META BASE64)' for PATH if the file is unchanged."
+  "Return cached `(STAT META BASE64 ETAG)' for PATH if the file is unchanged."
   (let ((hit (gethash path org-writenotes--svgz-cache)))
     (when (and hit (equal (car hit) (org-writenotes--file-stat path)))
       hit)))
 
-(defun org-writenotes--svgz-cache-put (path meta b64)
-  "Remember META and B64 for the current on-disk state of PATH."
+(defun org-writenotes--svgz-cache-put (path meta b64 &optional etag)
+  "Remember META, B64, and ETAG for the current on-disk state of PATH."
   (when (> (hash-table-count org-writenotes--svgz-cache) 64)
     (clrhash org-writenotes--svgz-cache))
   (when-let* ((stat (org-writenotes--file-stat path)))
-    (puthash path (list stat meta b64) org-writenotes--svgz-cache)))
+    (puthash path (list stat meta b64 etag) org-writenotes--svgz-cache)))
 
 (defun org-writenotes--extract-blocks (beg end org-file)
   "Parse lines between BEG and END into ordered content blocks.
@@ -1112,8 +1204,11 @@ ORG-FILE is the file used to resolve sketch links."
                        (b64 (if cached
                                 (nth 2 cached)
                               (when svgz-bytes (base64-encode-string svgz-bytes t))))
+                       (file-etag (if cached
+                                      (nth 3 cached)
+                                    (when svgz-bytes (secure-hash 'sha1 svgz-bytes))))
                        (_ (when (and (not cached) b64)
-                            (org-writenotes--svgz-cache-put abs-resolved meta b64))))
+                            (org-writenotes--svgz-cache-put abs-resolved meta b64 file-etag))))
                   (push `(:blockId ,(format "blk-%d" blk-idx)
                           :type "ink_canvas"
                           :startLine ,line-num
@@ -1124,6 +1219,7 @@ ORG-FILE is the file used to resolve sketch links."
                           :height ,h
                           :xRuling ,xr
                           :yRuling ,yr
+                          :etag ,(or file-etag :null)
                           :svgzBase64 ,(or b64 :null))
                         blocks))))
 
@@ -1337,7 +1433,8 @@ ORG-FILE is the file used to resolve sketch links."
             (org-writenotes--handle-insert-ink-block `((nodeId . ,new-nid)))
           (let ((snapshot (org-writenotes--parse-subtree-at-point)))
             (setq org-writenotes--active-node-id (plist-get snapshot :nodeId))
-            (org-writenotes--broadcast-notification "emacs.focusNode" snapshot)
+            (unless org-writenotes--in-rpc-client
+              (org-writenotes--broadcast-notification "emacs.focusNode" snapshot))
             snapshot))))))
 
 (defun org-writenotes--node-summary-at-point ()
@@ -1857,7 +1954,8 @@ Supports `mode' (\"paragraph\" or \"checklist\"), `text', and optional `fileName
             (save-buffer)))
         (goto-char (cdr loc))
         (let ((snapshot (org-writenotes--parse-subtree-at-point)))
-          (org-writenotes--broadcast-notification "emacs.focusNode" snapshot)
+          (unless org-writenotes--in-rpc-client
+            (org-writenotes--broadcast-notification "emacs.focusNode" snapshot))
           snapshot)))))
 
 (defun org-writenotes--handle-list-gallery (_params)
@@ -2169,7 +2267,8 @@ PARAMS is the RPC parameter alist.  Supports positioning via:
                  (org-back-to-heading t)
                  (org-writenotes--parse-subtree-at-point))))))
       (setq org-writenotes--active-node-id (plist-get snapshot :nodeId))
-      (org-writenotes--broadcast-notification "emacs.focusNode" snapshot)
+      (unless org-writenotes--in-rpc-client
+        (org-writenotes--broadcast-notification "emacs.focusNode" snapshot))
       snapshot)))
 
 (defun org-writenotes--remove-associated-ocr-at-point (&optional bare-filename)
@@ -2326,7 +2425,8 @@ PARAMS contains:
                (goto-char (cdr loc))
                (org-writenotes--parse-subtree-at-point)))))
       (setq org-writenotes--active-node-id (plist-get snapshot :nodeId))
-      (org-writenotes--broadcast-notification "emacs.focusNode" snapshot)
+      (unless org-writenotes--in-rpc-client
+        (org-writenotes--broadcast-notification "emacs.focusNode" snapshot))
       snapshot)))
 
 (defun org-writenotes--handle-ink-delta (params)
@@ -2353,6 +2453,19 @@ PARAMS contains:
                                 t t base-xml)))
             (puthash abs-path updated-xml org-writenotes--live-svg-cache)
             (org-writenotes--refresh-inline-image abs-path)))))
+    (when (and node-id filename)
+      (let ((peers (org-writenotes--peers-for-node node-id org-writenotes--in-rpc-client)))
+        (when peers
+          (let ((org-writenotes--clients peers))
+            (org-writenotes--broadcast-notification
+             "ink.delta"
+             `(:nodeId ,node-id
+               :fileName ,filename
+               :op ,(or (alist-get 'op params) "stroke_add")
+               :strokeId ,(or stroke-id :null)
+               :pathXml ,(or path-xml :null)
+               :canvasWidth ,(or (alist-get 'canvasWidth params) 1200)
+               :canvasHeight ,(or (alist-get 'canvasHeight params) 800)))))))
     `(:ok t :strokeId ,(or stroke-id :null))))
 
 (defun org-writenotes--update-ocr-drawer (node-id bare-filename ocr-text &optional create)
@@ -2527,8 +2640,10 @@ or nil if the helper failed."
         (puthash path hash org-writenotes--ocr-done)
         ;; A newer commit is already queued; its own run will supersede this text.
         (unless (gethash path org-writenotes--ocr-pending)
-          (org-writenotes--update-ocr-drawer
-           (plist-get entry :node-id) (plist-get entry :file) text t)))
+          (let ((nid (plist-get entry :node-id)))
+            (org-writenotes--update-ocr-drawer
+             nid (plist-get entry :file) text t)
+            (org-writenotes--notify-node-peers nid))))
     (run-at-time 0 nil #'org-writenotes--ocr-tick)))
 
 (defun org-writenotes--ocr-start (path entry)
@@ -2622,6 +2737,7 @@ if OCR text is provided."
           (org-writenotes--update-ocr-drawer node-id bare-filename ocr-text))
         (org-writenotes--ocr-enqueue abs-path node-id bare-filename))
       (org-writenotes--refresh-inline-image abs-path)
+      (org-writenotes--notify-node-peers node-id org-writenotes--in-rpc-client)
       `(:savedPath ,abs-path :bytesWritten ,(length raw-bytes)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -2726,21 +2842,89 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
 (defun org-writenotes--ws-send-json (proc payload-plist)
   "Serialize PAYLOAD-PLIST to JSON and send over WebSocket PROC."
   (when (and proc (process-live-p proc))
-    (let ((json-str (json-serialize payload-plist
-                                    :null-object :null
-                                    :false-object :false)))
-      (process-send-string proc (org-writenotes--ws-encode-frame json-str)))))
+    (let ((frame (if (and org-writenotes--ws-frame-cache
+                          (eq (car org-writenotes--ws-frame-cache) payload-plist))
+                     (cdr org-writenotes--ws-frame-cache)
+                   (let* ((json-str (json-serialize payload-plist
+                                                    :null-object :null
+                                                    :false-object :false))
+                          (encoded (org-writenotes--ws-encode-frame json-str)))
+                     (setq org-writenotes--ws-frame-cache (cons payload-plist encoded))
+                     encoded))))
+      (process-send-string proc frame))))
+
+(defun org-writenotes--record-pushed-etags (clients snapshot)
+  "Record each `ink_canvas' block `:etag' in SNAPSHOT on CLIENTS."
+  (let ((blocks (and (listp snapshot) (plist-get snapshot :blocks))))
+    (when (vectorp blocks)
+      (cl-loop for blk across blocks
+               when (equal (plist-get blk :type) "ink_canvas")
+               do (let ((fn (plist-get blk :fileName))
+                        (et (plist-get blk :etag)))
+                    (when (and (stringp fn) (stringp et))
+                      (let ((bare (file-name-nondirectory fn)))
+                        (dolist (client clients)
+                          (when (processp client)
+                            (let ((ht (or (process-get client 'pushed-etags)
+                                          (let ((new-ht (make-hash-table :test 'equal)))
+                                            (process-put client 'pushed-etags new-ht)
+                                            new-ht))))
+                              (puthash bare et ht)))))))))))
 
 (defun org-writenotes--broadcast-notification (method params-plist)
   "Broadcast a JSON-RPC 2.0 notification METHOD with PARAMS-PLIST to all connected tablets."
   (setq org-writenotes--clients
         (cl-remove-if-not #'process-live-p org-writenotes--clients))
-  (dolist (client org-writenotes--clients)
-    (org-writenotes--ws-send-json
-     client
-     `(:jsonrpc "2.0"
-       :method ,method
-       :params ,params-plist))))
+  (when (equal method "emacs.focusNode")
+    (org-writenotes--record-pushed-etags org-writenotes--clients params-plist)
+    (let ((focused-nid (and (listp params-plist) (plist-get params-plist :nodeId))))
+      (when (stringp focused-nid)
+        (dolist (client org-writenotes--clients)
+          (process-put client 'active-node focused-nid)))))
+  (when org-writenotes--clients
+    (let ((payload `(:jsonrpc "2.0"
+                     :method ,method
+                     :params ,params-plist)))
+      (dolist (client org-writenotes--clients)
+        (org-writenotes--ws-send-json client payload)))))
+
+(defun org-writenotes--client-watching-node-p (client node-id)
+  "Return non-nil if CLIENT is currently viewing NODE-ID."
+  (let ((client-node (and (processp client) (process-get client 'active-node))))
+    (or (equal client-node node-id)
+        (and (null client-node)
+             (equal node-id org-writenotes--active-node-id)))))
+
+(defun org-writenotes--peers-for-node (node-id &optional exclude-proc)
+  "Return live connected clients viewing NODE-ID, excluding EXCLUDE-PROC."
+  (setq org-writenotes--clients
+        (cl-remove-if-not #'process-live-p org-writenotes--clients))
+  (cl-loop for client in org-writenotes--clients
+           when (and (not (eq client exclude-proc))
+                     (org-writenotes--client-watching-node-p client node-id))
+           collect client))
+
+(defun org-writenotes--broadcast-to-node-peers (method params-plist node-id &optional exclude-proc)
+  "Broadcast METHOD with PARAMS-PLIST to live clients viewing NODE-ID, except EXCLUDE-PROC."
+  (when node-id
+    (let ((peers (org-writenotes--peers-for-node node-id exclude-proc)))
+      (when peers
+        (let ((org-writenotes--clients peers))
+          (org-writenotes--broadcast-notification method params-plist))))))
+
+(defun org-writenotes--notify-node-peers (node-id &optional exclude-proc)
+  "Push `emacs.nodeModified' to live clients viewing NODE-ID, except EXCLUDE-PROC."
+  (when node-id
+    (let ((peers (org-writenotes--peers-for-node node-id exclude-proc)))
+      (when peers
+        (when-let* ((loc (org-writenotes--locate-node node-id)))
+          (with-current-buffer (car loc)
+            (save-excursion
+              (goto-char (cdr loc))
+              (let ((snapshot (org-writenotes--parse-subtree-at-point t))
+                    (org-writenotes--clients peers))
+                (org-writenotes--record-pushed-etags peers snapshot)
+                (org-writenotes--broadcast-notification "emacs.nodeModified" snapshot)))))))))
 
 (defun org-writenotes--read-rpc-json (text)
   "Parse JSON-RPC TEXT into an alist, reusing the result for the same string object."
@@ -2756,6 +2940,8 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
   (cl-pushnew proc org-writenotes--clients)
   (message "[Org-WriteNotes] Tablet connected!")
   (when (and org-writenotes--active-node-id (process-live-p proc))
+    (unless (process-get proc 'active-node)
+      (process-put proc 'active-node org-writenotes--active-node-id))
     (let ((loc (org-writenotes--locate-node org-writenotes--active-node-id)))
       (when loc
         (with-current-buffer (car loc)
@@ -2769,16 +2955,20 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
 
 (defun org-writenotes--dispatch-rpc (proc msg-text)
   "Handle an incoming JSON-RPC 2.0 request MSG-TEXT from client PROC."
-  (let (req-id)
+  (let ((org-writenotes--in-rpc-client proc)
+        req-id)
     (condition-case err
         (let* ((req (org-writenotes--read-rpc-json msg-text))
                (id (alist-get 'id req))
                (method (alist-get 'method req))
                (params (alist-get 'params req))
+               (param-node (and (listp params) (alist-get 'nodeId params)))
                (result nil))
           (setq req-id id)
           (unless (or (equal method "session.hello") (process-get proc :authed))
             (error "Not authenticated: send session.hello first"))
+          (when (and (processp proc) (stringp param-node))
+            (process-put proc 'active-node param-node))
           (setq result
                 (pcase method
                   ("session.hello"
@@ -2791,6 +2981,11 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
                                 (not (equal token org-writenotes--session-token)))
                        (error "Authentication failed: invalid session token"))
                      (process-put proc :authed t)
+                     (when (processp proc)
+                       (cl-pushnew proc org-writenotes--clients)
+                       (when (and org-writenotes--active-node-id
+                                  (not (process-get proc 'active-node)))
+                         (process-put proc 'active-node org-writenotes--active-node-id)))
                      (run-at-time 0 nil #'org-writenotes--register-client proc)
                      `(:emacsVersion ,emacs-version
                        :orgVersion ,(org-version)
@@ -2808,6 +3003,8 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
                    (let* ((nid (or (alist-get 'nodeId params)
                                    org-writenotes--active-node-id))
                           (loc (org-writenotes--locate-node nid)))
+                     (when (and (processp proc) (stringp nid))
+                       (process-put proc 'active-node nid))
                      (if loc
                          (with-current-buffer (car loc)
                            (save-excursion
@@ -2855,7 +3052,20 @@ Returns `(opcode payload remaining-bytes)' or nil if incomplete."
           (when id
             (org-writenotes--ws-send-json
              proc
-             `(:jsonrpc "2.0" :id ,id :result ,result))))
+             `(:jsonrpc "2.0" :id ,id :result ,result)))
+          (when (and (listp result)
+                     (not (equal method "node.get"))
+                     (stringp (plist-get result :nodeId))
+                     (plist-member result :blocks))
+            (let ((res-nid (plist-get result :nodeId)))
+              (when (processp proc)
+                (process-put proc 'active-node res-nid))
+              (org-writenotes--broadcast-to-node-peers
+               "emacs.nodeModified" result res-nid proc)
+              (when (and (equal method "node.create")
+                         (stringp (alist-get 'parentId params)))
+                (org-writenotes--notify-node-peers
+                 (alist-get 'parentId params) proc)))))
       (error
        (message "[Org-WriteNotes] RPC Error: %s" (error-message-string err))
        (when req-id
@@ -3385,47 +3595,79 @@ connected tablet for stylus annotation."
     (error
      (message "[Org-WriteNotes] follow-mode warning: %s" (error-message-string err)))))
 
+(defun org-writenotes--watched-node-ids ()
+  "Return a deduplicated list of node IDs currently watched by Emacs or any live client."
+  (let ((ids nil))
+    (when org-writenotes--active-node-id
+      (push org-writenotes--active-node-id ids))
+    (dolist (client org-writenotes--clients)
+      (when (process-live-p client)
+        (let ((nid (process-get client 'active-node)))
+          (when (stringp nid)
+            (cl-pushnew nid ids :test #'equal)))))
+    (nreverse ids)))
+
 (defun org-writenotes--change-debounce-tick ()
-  "Check if the active Org node's `:etag' changed and broadcast `emacs.nodeModified'."
+  "Check if any watched Org node's `:etag' changed and broadcast `emacs.nodeModified'."
   (setq org-writenotes--change-debounce-timer nil)
-  (when (and org-writenotes--clients
-             org-writenotes--active-node-id)
-    (let ((loc (org-writenotes--locate-node org-writenotes--active-node-id)))
-      (when loc
-        (with-current-buffer (car loc)
-          (save-excursion
-            (goto-char (cdr loc))
-            (let* ((snapshot (org-writenotes--parse-subtree-at-point t))
-                   (new-etag (plist-get snapshot :etag)))
-              (when (and new-etag (not (equal new-etag org-writenotes--last-active-etag)))
-                (setq org-writenotes--last-active-etag new-etag)
-                (org-writenotes--broadcast-notification "emacs.nodeModified" snapshot)))))))))
+  (let ((changed-bufs org-writenotes--changed-buffers))
+    (setq org-writenotes--changed-buffers nil)
+    (setq org-writenotes--clients
+          (cl-remove-if-not #'process-live-p org-writenotes--clients))
+    (when org-writenotes--clients
+      (dolist (nid (org-writenotes--watched-node-ids))
+        (let ((loc (org-writenotes--locate-node nid)))
+          (when (and loc
+                     (or (null changed-bufs)
+                         (memq (car loc) changed-bufs)))
+            (with-current-buffer (car loc)
+              (save-excursion
+                (goto-char (cdr loc))
+                (let* ((prev-etag (or (gethash nid org-writenotes--node-etags)
+                                      (and (equal nid org-writenotes--active-node-id)
+                                           org-writenotes--last-active-etag)))
+                       (snapshot (org-writenotes--parse-subtree-at-point t))
+                       (new-etag (plist-get snapshot :etag)))
+                  (when (and new-etag (not (equal new-etag prev-etag)))
+                    (org-writenotes--broadcast-to-node-peers
+                     "emacs.nodeModified" snapshot nid)))))))))))
 
 (defun org-writenotes--on-buffer-changed (_beg _end _len)
-  "Debounced `after-change-functions' hook to broadcast live edits in the focused Org node."
-  (when (and org-writenotes--clients
+  "Debounced `after-change-functions' hook to broadcast live edits in watched Org nodes."
+  (when (and (null org-writenotes--in-rpc-client)
+             org-writenotes--clients
              (derived-mode-p 'org-mode)
-             org-writenotes--active-node-id)
+             (org-writenotes--watched-node-ids))
+    (cl-pushnew (current-buffer) org-writenotes--changed-buffers)
     (when (timerp org-writenotes--change-debounce-timer)
       (cancel-timer org-writenotes--change-debounce-timer))
     (setq org-writenotes--change-debounce-timer
           (run-with-idle-timer 0.6 nil #'org-writenotes--change-debounce-tick))))
 
 (defun org-writenotes--on-buffer-saved ()
-  "Broadcast `emacs.nodeModified' if the currently focused Org node was modified."
-  (when (and org-writenotes--clients
-             (derived-mode-p 'org-mode)
-             org-writenotes--active-node-id)
-    (let ((loc (org-writenotes--locate-node org-writenotes--active-node-id)))
-      (when (and loc (eq (car loc) (current-buffer)))
-        (save-restriction
-          (widen)
-          (save-excursion
-            (goto-char (cdr loc))
-            (org-back-to-heading t)
-            (let ((snapshot (org-writenotes--parse-subtree-at-point t)))
-              (setq org-writenotes--last-active-etag (plist-get snapshot :etag))
-              (org-writenotes--broadcast-notification "emacs.nodeModified" snapshot))))))))
+  "Broadcast `emacs.nodeModified' for watched Org nodes in the saved buffer."
+  (when (and (null org-writenotes--in-rpc-client)
+             org-writenotes--clients
+             (derived-mode-p 'org-mode))
+    (let ((saved-buf (current-buffer)))
+      (setq org-writenotes--changed-buffers
+            (delq saved-buf org-writenotes--changed-buffers))
+      (dolist (nid (org-writenotes--watched-node-ids))
+        (let ((loc (org-writenotes--locate-node nid)))
+          (when (and loc (eq (car loc) saved-buf))
+            (save-restriction
+              (widen)
+              (save-excursion
+                (goto-char (cdr loc))
+                (org-back-to-heading t)
+                (let* ((prev-etag (or (gethash nid org-writenotes--node-etags)
+                                      (and (equal nid org-writenotes--active-node-id)
+                                           org-writenotes--last-active-etag)))
+                       (snapshot (org-writenotes--parse-subtree-at-point t))
+                       (new-etag (plist-get snapshot :etag)))
+                  (when (or (null prev-etag) (not (equal new-etag prev-etag)))
+                    (org-writenotes--broadcast-to-node-peers
+                     "emacs.nodeModified" snapshot nid)))))))))))
 
 ;;;###autoload
 (define-minor-mode org-writenotes-follow-mode
